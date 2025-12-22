@@ -49,7 +49,7 @@ struct flow_info {
 	__u64 last_seen;
 	__u8 state;
 	__u8 pad[7];
-} __attribute__((packed));
+};
 
 struct packet_sample {
 	struct flow_key key;
