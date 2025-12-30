@@ -1,12 +1,15 @@
 #!/bin/sh
 
-[ -f /etc/config/classifi ] && exit 0
+if [ -f /etc/config/classifi ]; then
+	[ "$(uci -q get classifi.config.discover)" = "1" ] && exit 0
+	rm /etc/config/classifi
+fi
 
 touch /etc/config/classifi
 
 uci -q batch <<-EOF
 	set classifi.config='classifi'
-	set classifi.config.interface='br-lan'
+	set classifi.config.discover='1'
 	set classifi.config.enabled='1'
 EOF
 

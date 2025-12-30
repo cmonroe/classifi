@@ -11,8 +11,8 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
-#ifndef CLASSIFI_COMMON_H
-#define CLASSIFI_COMMON_H
+#ifndef CLASSIFI_BPF_H
+#define CLASSIFI_BPF_H
 
 #include <linux/types.h>
 
@@ -55,10 +55,11 @@ struct packet_sample {
 	struct flow_key key;
 	__u64 ts_ns;
 	__u32 data_len;
+	__u32 ifindex;
 	__u16 l3_offset;
 	__u8 direction;
 	__u8 pad;
 	__u8 data[MAX_PACKET_SAMPLE];
 } __attribute__((packed));
 
-#endif /* CLASSIFI_COMMON_H */
+#endif /* CLASSIFI_BPF_H */

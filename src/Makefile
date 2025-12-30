@@ -6,7 +6,7 @@ CLANG ?= clang
 BPFTOOL ?= bpftool
 
 CFLAGS := -Wall -O2 -g
-LDFLAGS := -lbpf -lelf -lz -lndpi
+LDFLAGS := -lbpf -lelf -lz -lndpi -lubus -lubox -lblobmsg_json -luci
 
 BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_x86
 BPF_INCLUDE := -I/usr/include/bpf
@@ -17,11 +17,11 @@ TARGETS := classifi classifi.bpf.o
 
 all: $(TARGETS)
 
-classifi.bpf.o: classifi.bpf.c classifi_common.h
+classifi.bpf.o: classifi.bpf.c classifi_bpf.h
 	$(CLANG) $(BPF_CFLAGS) $(BPF_INCLUDE) -c $< -o $@
 
-classifi: classifi.c classifi_common.h
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+classifi: classifi.c classifi_ubus.c classifi.h classifi_bpf.h classifi_ubus.h
+	$(CC) $(CFLAGS) -o $@ classifi.c classifi_ubus.c $(LDFLAGS)
 
 clean:
 	rm -f $(TARGETS)

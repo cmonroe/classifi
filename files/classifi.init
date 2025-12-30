@@ -8,20 +8,37 @@ USE_PROCD=1
 PROG=/usr/sbin/classifi
 BPF_OBJ=/usr/lib/bpf/classifi.bpf.o
 
+append_iface() {
+	IFACE_ARGS="$IFACE_ARGS -i $1"
+}
+
 start_service() {
-	local interface
+	local enabled discover
 
 	if [ "$(uci get operating-mode.settings.current_mode)" != "router" ]; then
 		return
 	fi
 
+	config_load 'classifi'
+	config_get_bool enabled 'config' 'enabled' 1
+	[ "$enabled" -eq 0 ] && return
+
+	config_get_bool discover 'config' 'discover' 1
+
+	IFACE_ARGS=""
+	if [ "$discover" -eq 1 ]; then
+		IFACE_ARGS="-d"
+	else
+		config_list_foreach 'config' 'interface' append_iface
+		if [ -z "$IFACE_ARGS" ]; then
+			IFACE_ARGS="-i br-lan"
+		fi
+	fi
+
 	logger -p crit -t "classifi.init" "starting classifi"
 
-	config_load 'classifi'
-	config_get interface 'config' 'interface' 'br-lan'
-
 	procd_open_instance
-	procd_set_param command "$PROG" "$interface" "$BPF_OBJ"
+	procd_set_param command "$PROG" $IFACE_ARGS "$BPF_OBJ"
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1

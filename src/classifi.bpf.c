@@ -22,7 +22,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#include "classifi_common.h"
+#include "classifi_bpf.h"
 
 #ifndef ETH_P_8021AD
 #define ETH_P_8021AD 0x88A8
@@ -258,6 +258,7 @@ static __always_inline void sample_packet(struct __sk_buff *skb,
 
 	__builtin_memcpy(&sample->key, key, sizeof(*key));
 	sample->ts_ns = ts_ns;
+	sample->ifindex = skb->ifindex;
 	sample->l3_offset = l3_offset;
 	sample->direction = direction;
 	sample->pad = 0;
