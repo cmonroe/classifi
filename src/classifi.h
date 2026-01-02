@@ -14,6 +14,7 @@
 #ifndef CLASSIFI_H
 #define CLASSIFI_H
 
+#include <stdint.h>
 #include <time.h>
 #include <ndpi/ndpi_api.h>
 #include <bpf/libbpf.h>
@@ -22,8 +23,15 @@
 
 #include "classifi_bpf.h"
 
+static inline uint64_t monotonic_time_sec(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec;
+}
+
 #define FLOW_TABLE_SIZE 1024
-#define DNS_TABLE_SIZE 128
 #define MAX_INTERFACES 8
 
 struct interface_info {
@@ -39,15 +47,6 @@ struct interface_info {
 	__u32 tc_priority_egress;
 };
 
-struct dns_stats {
-	struct flow_addr client_ip;
-	__u8 family;
-	__u64 queries;
-	__u64 responses;
-	char last_query[128];
-	struct dns_stats *next;
-};
-
 struct ndpi_flow {
 	struct flow_key key;
 	struct flow_key first_packet_key;
@@ -59,8 +58,8 @@ struct ndpi_flow {
 	int detection_finalized;
 	int protocol_guessed;
 	int have_first_packet_key;
-	time_t first_seen;
-	time_t last_seen;
+	uint64_t first_seen;
+	uint64_t last_seen;
 	char tcp_fingerprint[64];
 	char os_hint[32];
 	int protocol_stack_count;
@@ -72,7 +71,6 @@ struct classifi_ctx {
 	struct ndpi_detection_module_struct *ndpi;
 
 	struct ndpi_flow *flow_table[FLOW_TABLE_SIZE];
-	struct dns_stats *dns_table[DNS_TABLE_SIZE];
 
 	struct interface_info interfaces[MAX_INTERFACES];
 	int num_interfaces;
@@ -103,16 +101,8 @@ typedef void (*flow_visitor_fn)(struct classifi_ctx *ctx,
 				struct ndpi_flow *flow,
 				void *user_data);
 
-typedef void (*dns_visitor_fn)(struct classifi_ctx *ctx,
-			       struct dns_stats *stats,
-			       void *user_data);
-
 void flow_table_iterate(struct classifi_ctx *ctx,
 			flow_visitor_fn visitor,
 			void *user_data);
-
-void dns_table_iterate(struct classifi_ctx *ctx,
-		       dns_visitor_fn visitor,
-		       void *user_data);
 
 #endif /* CLASSIFI_H */

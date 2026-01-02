@@ -36,7 +36,7 @@ struct bpf_vlan_hdr {
 char LICENSE[] SEC("license") = "GPL v2";
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, MAX_FLOWS);
 	__type(key, struct flow_key);
 	__type(value, struct flow_info);
@@ -202,8 +202,14 @@ static __always_inline __u8 canonicalize_flow_key(struct flow_key *key)
 		else if (key->src.hi == key->dst.hi &&
 		         key->src.lo > key->dst.lo)
 			swapped = 1;
+		else if (key->src.hi == key->dst.hi &&
+		         key->src.lo == key->dst.lo &&
+		         key->src_port > key->dst_port)
+			swapped = 1;
 	} else {
-		if (key->src_port > key->dst_port)
+		if (key->src.hi > key->dst.hi)
+			swapped = 1;
+		else if (key->src.hi == key->dst.hi && key->src.lo > key->dst.lo)
 			swapped = 1;
 	}
 
@@ -301,7 +307,13 @@ int classifi(struct __sk_buff *skb)
 		new_info.last_seen = now;
 		new_info.state = FLOW_STATE_NEW;
 
-		bpf_map_update_elem(&flow_map, &key, &new_info, BPF_ANY);
+		if (bpf_map_update_elem(&flow_map, &key, &new_info, BPF_ANY) < 0) {
+			__u32 stats_key = 0;
+			__u64 *count = bpf_map_lookup_elem(&ringbuf_stats, &stats_key);
+			if (count)
+				__sync_fetch_and_add(count, 1);
+			return TC_ACT_OK;
+		}
 		sample_packet(skb, &key, data, data_end, direction, now, l3_offset);
 	} else {
 		old_count = __sync_fetch_and_add(&info->packets, 1);

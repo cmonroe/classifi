@@ -97,19 +97,6 @@ static void cleanup_flow_table(struct classifi_ctx *ctx)
 	}
 }
 
-static void cleanup_dns_table(struct classifi_ctx *ctx)
-{
-	for (int i = 0; i < DNS_TABLE_SIZE; i++) {
-		struct dns_stats *stats = ctx->dns_table[i];
-		while (stats) {
-			struct dns_stats *next = stats->next;
-			free(stats);
-			stats = next;
-		}
-		ctx->dns_table[i] = NULL;
-	}
-}
-
 #define FNV_OFFSET 2166136261u
 #define FNV_PRIME 16777619u
 
@@ -122,7 +109,28 @@ static inline unsigned int fnv_mix64(unsigned int hash, __u64 value)
 	return hash;
 }
 
-static int extract_dns_query_name(const unsigned char *dns_payload, unsigned int len, char *out, size_t out_len)
+static const char *dns_qtype_str(uint16_t qtype, char *buf, size_t buflen)
+{
+	switch (qtype) {
+	case 1:  return "A";
+	case 2:  return "NS";
+	case 5:  return "CNAME";
+	case 6:  return "SOA";
+	case 12: return "PTR";
+	case 15: return "MX";
+	case 16: return "TXT";
+	case 28: return "AAAA";
+	case 33: return "SRV";
+	case 64: return "SVCB";
+	case 65: return "HTTPS";
+	default:
+		snprintf(buf, buflen, "TYPE%u", qtype);
+		return buf;
+	}
+}
+
+static int extract_dns_query_name(const unsigned char *dns_payload, unsigned int len,
+				  char *out, size_t out_len, uint16_t *qtype)
 {
 	unsigned int pos = 12;
 	unsigned int out_pos = 0;
@@ -138,6 +146,11 @@ static int extract_dns_query_name(const unsigned char *dns_payload, unsigned int
 				out[out_pos - 1] = '\0';
 			else
 				out[0] = '\0';
+
+			pos++;
+			if (pos + 2 <= len && qtype)
+				*qtype = (dns_payload[pos] << 8) | dns_payload[pos + 1];
+
 			return 0;
 		}
 
@@ -152,52 +165,12 @@ static int extract_dns_query_name(const unsigned char *dns_payload, unsigned int
 		for (unsigned int i = 0; i < label_len && out_pos < out_len - 2; i++) {
 			out[out_pos++] = dns_payload[pos++];
 		}
-		out[out_pos++] = '.';
+		if (out_pos < out_len - 1)
+			out[out_pos++] = '.';
 	}
 
 	out[0] = '\0';
 	return -1;
-}
-
-static unsigned int dns_hash(struct flow_addr *addr, __u8 family)
-{
-	unsigned int hash = FNV_OFFSET;
-	hash ^= family;
-	hash *= FNV_PRIME;
-	hash = fnv_mix64(hash, addr->hi);
-	hash = fnv_mix64(hash, addr->lo);
-	return hash % DNS_TABLE_SIZE;
-}
-
-static struct dns_stats *dns_lookup(struct classifi_ctx *ctx, struct flow_addr *addr, __u8 family)
-{
-	unsigned int hash = dns_hash(addr, family);
-	struct dns_stats *stats = ctx->dns_table[hash];
-
-	while (stats) {
-		if (stats->family == family &&
-		    stats->client_ip.hi == addr->hi &&
-		    stats->client_ip.lo == addr->lo)
-			return stats;
-		stats = stats->next;
-	}
-	return NULL;
-}
-
-static struct dns_stats *dns_insert(struct classifi_ctx *ctx, struct flow_addr *addr, __u8 family)
-{
-	unsigned int hash = dns_hash(addr, family);
-	struct dns_stats *stats = calloc(1, sizeof(*stats));
-
-	if (!stats)
-		return NULL;
-
-	stats->family = family;
-	stats->client_ip = *addr;
-	stats->next = ctx->dns_table[hash];
-	ctx->dns_table[hash] = stats;
-
-	return stats;
 }
 
 static unsigned int flow_hash(struct flow_key *key)
@@ -288,7 +261,7 @@ static struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow
 
 	memset(flow->flow, 0, SIZEOF_FLOW_STRUCT);
 
-	flow->first_seen = time(NULL);
+	flow->first_seen = monotonic_time_sec();
 	flow->last_seen = flow->first_seen;
 
 	flow->next = ctx->flow_table[hash];
@@ -453,7 +426,9 @@ static __u8 canonicalize_flow_key_libpcap(struct flow_key *key)
 			 key->src_port > key->dst_port)
 			swapped = 1;
 	} else {
-		if (key->src_port > key->dst_port)
+		if (key->src.hi > key->dst.hi)
+			swapped = 1;
+		else if (key->src.hi == key->dst.hi && key->src.lo > key->dst.lo)
 			swapped = 1;
 	}
 
@@ -538,34 +513,6 @@ int get_interface_ip(struct interface_info *iface)
 	return found ? 0 : -1;
 }
 
-static int should_filter_flow(struct classifi_ctx *ctx, struct flow_key *key)
-{
-	if (key->family == FLOW_FAMILY_IPV4) {
-		__u32 dst_ip = (__u32)key->dst.lo;
-		if (dst_ip == 0xFFFFFFFF)
-			return 1;
-	}
-
-	if (key->src_port == 6379 || key->dst_port == 6379) {
-		for (int i = 0; i < ctx->num_interfaces; i++) {
-			struct interface_info *iface = &ctx->interfaces[i];
-			if (iface->local_ip_family == 0 || key->family != iface->local_ip_family)
-				continue;
-
-			if (key->family == FLOW_FAMILY_IPV4) {
-				if (key->src.lo == iface->local_ip.lo || key->dst.lo == iface->local_ip.lo)
-					return 1;
-			} else if (key->family == FLOW_FAMILY_IPV6) {
-				if ((key->src.hi == iface->local_ip.hi && key->src.lo == iface->local_ip.lo) ||
-				    (key->dst.hi == iface->local_ip.hi && key->dst.lo == iface->local_ip.lo))
-					return 1;
-			}
-		}
-	}
-
-	return 0;
-}
-
 static void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow, const char *ifname)
 {
 	struct blob_buf b = {};
@@ -617,6 +564,29 @@ static void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow
 		if (ctx->verbose)
 			fprintf(stderr, "failed to send ubus event for flow %s:%u -> %s:%u\n",
 				src_ip, summary_key.src_port, dst_ip, summary_key.dst_port);
+	}
+
+	blob_buf_free(&b);
+}
+
+static void emit_dns_event(struct classifi_ctx *ctx, const char *client_ip, const char *domain,
+			   uint16_t qtype, const char *ifname)
+{
+	struct blob_buf b = {};
+	char qtype_buf[16];
+
+	if (!ctx->ubus_ctx || !ifname)
+		return;
+
+	blob_buf_init(&b, 0);
+	blobmsg_add_string(&b, "interface", ifname);
+	blobmsg_add_string(&b, "client_ip", client_ip);
+	blobmsg_add_string(&b, "domain", domain);
+	blobmsg_add_string(&b, "query_type", dns_qtype_str(qtype, qtype_buf, sizeof(qtype_buf)));
+
+	if (ubus_send_event(ctx->ubus_ctx, "classifi.dns_query", b.head) != 0) {
+		if (ctx->verbose)
+			fprintf(stderr, "Failed to send DNS event for %s -> %s\n", client_ip, domain);
 	}
 
 	blob_buf_free(&b);
@@ -677,9 +647,6 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 
 	total_samples++;
 
-	if (should_filter_flow(ctx, &sample->key))
-		return;
-
 	packet_view = sample->key;
 	if (sample->direction)
 		swap_flow_endpoints(&packet_view);
@@ -708,7 +675,7 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	}
 
 	flow->packets_processed++;
-	flow->last_seen = time(NULL);
+	flow->last_seen = monotonic_time_sec();
 	if (sample->direction == 0)
 		flow->packets_dir0++;
 	else
@@ -751,7 +718,7 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		return;
 	}
 
-	u_int64_t time_ms = sample->ts_ns ? sample->ts_ns / 1000000ULL : (u_int64_t)time(NULL) * 1000ULL;
+	u_int64_t time_ms = sample->ts_ns ? sample->ts_ns / 1000000ULL : monotonic_time_sec() * 1000ULL;
 
 	protocol = ndpi_detection_process_packet(
 		ctx->ndpi, flow->flow, ip_packet, ip_packet_len,
@@ -766,8 +733,11 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	}
 
 	if (protocol.protocol_stack.protos_num > 0 && flow->protocol_stack_count == 0) {
-		flow->protocol_stack_count = protocol.protocol_stack.protos_num;
-		for (int i = 0; i < protocol.protocol_stack.protos_num && i < 8; i++)
+		int stack_count = protocol.protocol_stack.protos_num;
+		if (stack_count > 8)
+			stack_count = 8;
+		flow->protocol_stack_count = stack_count;
+		for (int i = 0; i < stack_count; i++)
 			flow->protocol_stack[i] = protocol.protocol_stack.protos[i];
 	}
 
@@ -803,7 +773,7 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	}
 
 	if ((protocol.proto.app_protocol == NDPI_PROTOCOL_DNS ||
-	     packet_view.dst_port == 53 || packet_view.src_port == 53) &&
+	     packet_view.dst_port == 53) &&
 	    packet_view.protocol == IPPROTO_UDP && flow->packets_processed <= 2) {
 
 		const unsigned char *dns_payload = NULL;
@@ -825,29 +795,12 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 
 		if (dns_payload && dns_len > 0) {
 			char query_name[256];
-			struct dns_stats *stats;
-			struct flow_addr *client_addr;
+			uint16_t qtype = 0;
 
-			if (packet_view.src_port == 53)
-				client_addr = &packet_view.dst;
-			else
-				client_addr = &packet_view.src;
-
-			stats = dns_lookup(ctx, client_addr, packet_view.family);
-			if (!stats)
-				stats = dns_insert(ctx, client_addr, packet_view.family);
-
-			if (stats) {
-				if (packet_view.dst_port == 53) {
-					stats->queries++;
-					if (extract_dns_query_name(dns_payload, dns_len, query_name, sizeof(query_name)) == 0) {
-						strncpy(stats->last_query, query_name, sizeof(stats->last_query) - 1);
-						if (ctx->verbose)
-							fprintf(stderr, "  [DNS] Query: %s from %s\n", query_name, src_ip);
-					}
-				} else {
-					stats->responses++;
-				}
+			if (extract_dns_query_name(dns_payload, dns_len, query_name, sizeof(query_name), &qtype) == 0) {
+				emit_dns_event(ctx, src_ip, query_name, qtype, interface_name_by_index(ctx, sample->ifindex));
+				if (ctx->verbose)
+					fprintf(stderr, "  [DNS] Query: %s from %s\n", query_name, src_ip);
 			}
 		}
 	}
@@ -920,6 +873,12 @@ static int handle_sample(void *ctx, void *data, size_t len)
 	struct packet_sample *sample = data;
 
 	if (len < sizeof(*sample))
+		return 0;
+
+	if (sample->data_len > MAX_PACKET_SAMPLE)
+		return 0;
+
+	if (sample->l3_offset > sample->data_len)
 		return 0;
 
 	classify_packet(classifi_ctx, sample);
@@ -1035,6 +994,10 @@ static int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,
 	ret = bpf_tc_attach(&hook, &opts_egress);
 	if (ret) {
 		fprintf(stderr, "failed to attach TC program to %s egress: %s\n", ifname, strerror(-ret));
+		hook.attach_point = BPF_TC_INGRESS;
+		bpf_tc_detach(&hook, &opts_ingress);
+		hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
+		bpf_tc_hook_destroy(&hook);
 		return ret;
 	}
 
@@ -1079,59 +1042,12 @@ static void print_flow_stats(int flow_map_fd)
 	printf("Total flows: %d\n\n", count);
 }
 
-static void print_dns_summary(struct classifi_ctx *ctx)
-{
-	char client_ip[INET6_ADDRSTRLEN];
-	time_t now = time(NULL);
-	struct tm *tm_info = localtime(&now);
-	char timestamp[20];
-	int total_clients = 0;
-
-	strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
-
-	printf("\n=== DNS Summary ===\n");
-
-	for (int i = 0; i < DNS_TABLE_SIZE; i++) {
-		struct dns_stats *stats = ctx->dns_table[i];
-		while (stats) {
-			if (stats->family == FLOW_FAMILY_IPV4) {
-				struct in_addr addr = { .s_addr = (__u32)stats->client_ip.lo };
-				inet_ntop(AF_INET, &addr, client_ip, sizeof(client_ip));
-			} else if (stats->family == FLOW_FAMILY_IPV6) {
-				struct in6_addr addr6;
-				memcpy(&addr6, &stats->client_ip, sizeof(addr6));
-				inet_ntop(AF_INET6, &addr6, client_ip, sizeof(client_ip));
-			} else {
-				snprintf(client_ip, sizeof(client_ip), "unknown");
-			}
-
-			printf("%s | %-39s | Q:%-5llu R:%-5llu | Last: %s\n",
-			       timestamp, client_ip,
-			       stats->queries, stats->responses,
-			       stats->last_query[0] ? stats->last_query : "(none)");
-
-			total_clients++;
-			stats = stats->next;
-		}
-	}
-
-	if (total_clients == 0)
-		printf("  No DNS activity\n");
-
-	printf("\n");
-}
-
 static void print_classified_flows(struct classifi_ctx *ctx)
 {
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
 	const char *master_name, *app_name;
-	time_t now = time(NULL);
-	struct tm *tm_info = localtime(&now);
-	char timestamp[20];
-
+	uint64_t now = monotonic_time_sec();
 	struct flow_key summary_key;
-
-	strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
 
 	for (int i = 0; i < FLOW_TABLE_SIZE; i++) {
 		struct ndpi_flow *flow = ctx->flow_table[i];
@@ -1164,27 +1080,24 @@ static void print_classified_flows(struct classifi_ctx *ctx)
 
 				const char *category_name = ndpi_category_get_name(ctx->ndpi, flow->protocol.category);
 
-				printf("%s | %-39s:%-5u -> %-39s:%-5u proto=%-3u | %-8s / %-20s | %-16s | pkts=%d (d0:%d d1:%d)\n",
-				       timestamp,
+				printf("%-39s:%-5u -> %-39s:%-5u proto=%-3u | %-8s / %-20s | %-16s | pkts=%d (d0:%d d1:%d) age=%llus\n",
 				       src_ip, summary_key.src_port,
 				       dst_ip, summary_key.dst_port,
 				       summary_key.protocol,
 				       master_name, app_name,
 				       category_name,
 				       flow->packets_processed,
-				       flow->packets_dir0, flow->packets_dir1);
+				       flow->packets_dir0, flow->packets_dir1,
+				       (unsigned long long)(now - flow->first_seen));
 			}
 			flow = flow->next;
 		}
 	}
-
-	if (ctx->suppress_noisy)
-		print_dns_summary(ctx);
 }
 
 static void cleanup_expired_flows(struct classifi_ctx *ctx)
 {
-	time_t now = time(NULL);
+	uint64_t now = monotonic_time_sec();
 	int total_flows = 0;
 	int expired_flows = 0;
 
@@ -1195,18 +1108,20 @@ static void cleanup_expired_flows(struct classifi_ctx *ctx)
 		while (flow) {
 			total_flows++;
 
-			time_t idle_time = now - flow->last_seen;
-			time_t age = now - flow->first_seen;
+			uint64_t idle_time = now - flow->last_seen;
+			uint64_t age = now - flow->first_seen;
 
 			int should_expire = 0;
 			if (idle_time >= FLOW_IDLE_TIMEOUT) {
 				should_expire = 1;
 				if (ctx->verbose)
-					fprintf(stderr, "expiring idle flow (idle %ld sec)\n", idle_time);
+					fprintf(stderr, "expiring idle flow (idle %llu sec)\n",
+						(unsigned long long)idle_time);
 			} else if (age >= FLOW_ABSOLUTE_TIMEOUT) {
 				should_expire = 1;
 				if (ctx->verbose)
-					fprintf(stderr, "expiring old flow (age %ld sec)\n", age);
+					fprintf(stderr, "expiring old flow (age %llu sec)\n",
+						(unsigned long long)age);
 			}
 
 			if (should_expire) {
@@ -1247,17 +1162,6 @@ void flow_table_iterate(struct classifi_ctx *ctx, flow_visitor_fn visitor, void 
 	}
 }
 
-void dns_table_iterate(struct classifi_ctx *ctx, dns_visitor_fn visitor, void *user_data)
-{
-	for (int i = 0; i < DNS_TABLE_SIZE; i++) {
-		struct dns_stats *stats = ctx->dns_table[i];
-		while (stats) {
-			visitor(ctx, stats, user_data);
-			stats = stats->next;
-		}
-	}
-}
-
 static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *pkthdr,
 				const unsigned char *packet)
 {
@@ -1278,9 +1182,6 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 		return;
 
 	direction = canonicalize_flow_key_libpcap(&key);
-
-	if (should_filter_flow(ctx, &key))
-		return;
 
 	packet_view = key;
 	if (direction)
@@ -1310,7 +1211,7 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 	}
 
 	flow->packets_processed++;
-	flow->last_seen = time(NULL);
+	flow->last_seen = monotonic_time_sec();
 	if (direction == 0)
 		flow->packets_dir0++;
 	else
@@ -1351,8 +1252,11 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 	}
 
 	if (protocol.protocol_stack.protos_num > 0 && flow->protocol_stack_count == 0) {
-		flow->protocol_stack_count = protocol.protocol_stack.protos_num;
-		for (int i = 0; i < protocol.protocol_stack.protos_num && i < 8; i++)
+		int stack_count = protocol.protocol_stack.protos_num;
+		if (stack_count > 8)
+			stack_count = 8;
+		flow->protocol_stack_count = stack_count;
+		for (int i = 0; i < stack_count; i++)
 			flow->protocol_stack[i] = protocol.protocol_stack.protos[i];
 	}
 
@@ -1388,7 +1292,7 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 	}
 
 	if ((protocol.proto.app_protocol == NDPI_PROTOCOL_DNS ||
-	     packet_view.dst_port == 53 || packet_view.src_port == 53) &&
+	     packet_view.dst_port == 53) &&
 	    packet_view.protocol == IPPROTO_UDP && flow->packets_processed <= 2) {
 
 		const unsigned char *dns_payload = NULL;
@@ -1410,29 +1314,12 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 
 		if (dns_payload && dns_len > 0) {
 			char query_name[256];
-			struct dns_stats *stats;
-			struct flow_addr *client_addr;
+			uint16_t qtype = 0;
 
-			if (packet_view.src_port == 53)
-				client_addr = &packet_view.dst;
-			else
-				client_addr = &packet_view.src;
-
-			stats = dns_lookup(ctx, client_addr, packet_view.family);
-			if (!stats)
-				stats = dns_insert(ctx, client_addr, packet_view.family);
-
-			if (stats) {
-				if (packet_view.dst_port == 53) {
-					stats->queries++;
-					if (extract_dns_query_name(dns_payload, dns_len, query_name, sizeof(query_name)) == 0) {
-						strncpy(stats->last_query, query_name, sizeof(stats->last_query) - 1);
-						if (ctx->verbose)
-							fprintf(stderr, "  [DNS] Query: %s from %s\n", query_name, src_ip);
-					}
-				} else {
-					stats->responses++;
-				}
+			if (extract_dns_query_name(dns_payload, dns_len, query_name, sizeof(query_name), &qtype) == 0) {
+				emit_dns_event(ctx, src_ip, query_name, qtype, ctx->pcap_ifname);
+				if (ctx->verbose)
+					fprintf(stderr, "  [DNS] Query: %s from %s\n", query_name, src_ip);
 			}
 		}
 	}
@@ -1501,7 +1388,7 @@ static int run_pcap_mode(struct classifi_ctx *ctx, const char *ifname)
 
 	ctx->flow_map_fd = -1;
 
-	time_t last_cleanup = time(NULL);
+	uint64_t last_cleanup = monotonic_time_sec();
 	while (keep_running) {
 		int ret = pcap_dispatch(handle, 100, pcap_packet_handler, (unsigned char *)ctx);
 
@@ -1510,7 +1397,7 @@ static int run_pcap_mode(struct classifi_ctx *ctx, const char *ifname)
 			break;
 		}
 
-		time_t now = time(NULL);
+		uint64_t now = monotonic_time_sec();
 		if (now - last_cleanup >= CLEANUP_INTERVAL) {
 			cleanup_expired_flows(ctx);
 			last_cleanup = now;
@@ -1749,7 +1636,6 @@ cleanup:
 	ctx.ringbuf = NULL;
 	bpf_object__close(ctx.bpf_obj);
 	cleanup_flow_table(&ctx);
-	cleanup_dns_table(&ctx);
 	if (ctx.ndpi)
 		ndpi_exit_detection_module(ctx.ndpi);
 

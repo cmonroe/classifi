@@ -235,6 +235,10 @@ attach_tc_program(struct classifi_ctx *ctx, int prog_fd,
 	ret = bpf_tc_attach(&hook, &opts_egress);
 	if (ret) {
 		fprintf(stderr, "failed to attach TC program to %s egress: %s\n", ifname, strerror(-ret));
+		hook.attach_point = BPF_TC_INGRESS;
+		bpf_tc_detach(&hook, &opts_ingress);
+		hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
+		bpf_tc_hook_destroy(&hook);
 		return ret;
 	}
 
@@ -360,7 +364,7 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
 	const char *master_name, *app_name, *category_name;
 	struct flow_key display_key;
-	time_t now = time(NULL);
+	uint64_t now = monotonic_time_sec();
 
 	if (flow->have_first_packet_key)
 		display_key = flow->first_packet_key;
@@ -394,8 +398,7 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 	blobmsg_add_u32(b, "packets_tx", flow->packets_dir0);
 	blobmsg_add_u32(b, "packets_rx", flow->packets_dir1);
 
-	blobmsg_add_u32(b, "first_seen", flow->first_seen);
-	blobmsg_add_u32(b, "last_seen", flow->last_seen);
+	blobmsg_add_u32(b, "age", now - flow->first_seen);
 	blobmsg_add_u32(b, "idle_time", now - flow->last_seen);
 
 	blobmsg_add_u8(b, "classified", flow->detection_finalized);
@@ -407,56 +410,17 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 		blobmsg_add_string(b, "os_hint", flow->os_hint);
 
 	if (flow->protocol_stack_count > 1) {
+		int stack_count = flow->protocol_stack_count;
+		if (stack_count > 8)
+			stack_count = 8;
 		stack_array = blobmsg_open_array(b, "protocol_stack");
-		for (int j = 0; j < flow->protocol_stack_count; j++)
+		for (int j = 0; j < stack_count; j++)
 			blobmsg_add_string(b, NULL, ndpi_get_proto_name(ctx->ndpi, flow->protocol_stack[j]));
 		blobmsg_close_array(b, stack_array);
 	}
 
 	blobmsg_close_table(b, flow_obj);
 	fbc->count++;
-}
-
-struct dns_blob_ctx {
-	struct blob_buf *b;
-	int count;
-};
-
-static void
-dns_to_blob(struct classifi_ctx *ctx, struct dns_stats *stats, void *user_data)
-{
-	struct dns_blob_ctx *dbc = user_data;
-	struct blob_buf *b = dbc->b;
-	void *client_obj;
-	char ip_str[INET6_ADDRSTRLEN];
-
-	(void)ctx;
-
-	client_obj = blobmsg_open_table(b, NULL);
-
-	if (stats->family == FLOW_FAMILY_IPV4) {
-		struct in_addr addr = { .s_addr = (__u32)stats->client_ip.lo };
-		inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-		blobmsg_add_string(b, "family", "ipv4");
-	} else if (stats->family == FLOW_FAMILY_IPV6) {
-		struct in6_addr addr6;
-		memcpy(&addr6, &stats->client_ip, sizeof(addr6));
-		inet_ntop(AF_INET6, &addr6, ip_str, sizeof(ip_str));
-		blobmsg_add_string(b, "family", "ipv6");
-	} else {
-		snprintf(ip_str, sizeof(ip_str), "unknown");
-		blobmsg_add_string(b, "family", "unknown");
-	}
-
-	blobmsg_add_string(b, "client_ip", ip_str);
-	blobmsg_add_u64(b, "queries", stats->queries);
-	blobmsg_add_u64(b, "responses", stats->responses);
-
-	if (stats->last_query[0])
-		blobmsg_add_string(b, "last_query", stats->last_query);
-
-	blobmsg_close_table(b, client_obj);
-	dbc->count++;
 }
 
 static int
@@ -567,36 +531,10 @@ classifi_get_flows_handler(struct ubus_context *uctx, struct ubus_object *obj,
 	return UBUS_STATUS_OK;
 }
 
-static int
-classifi_get_dns_stats_handler(struct ubus_context *uctx, struct ubus_object *obj,
-			       struct ubus_request_data *req, const char *method,
-			       struct blob_attr *msg)
-{
-	struct blob_buf b = {};
-	struct dns_blob_ctx dbc = { .b = &b, .count = 0 };
-	void *clients_array;
-
-	(void)obj;
-	(void)method;
-	(void)msg;
-
-	blob_buf_init(&b, 0);
-	clients_array = blobmsg_open_array(&b, "clients");
-	dns_table_iterate(g_ctx, dns_to_blob, &dbc);
-	blobmsg_close_array(&b, clients_array);
-	blobmsg_add_u32(&b, "count", dbc.count);
-
-	ubus_send_reply(uctx, req, b.head);
-	blob_buf_free(&b);
-
-	return UBUS_STATUS_OK;
-}
-
 static const struct ubus_method classifi_methods[] = {
 	UBUS_METHOD_NOARG("reload_config", classifi_reload_config_handler),
 	UBUS_METHOD_NOARG("status", classifi_status_handler),
 	UBUS_METHOD_NOARG("get_flows", classifi_get_flows_handler),
-	UBUS_METHOD_NOARG("get_dns_stats", classifi_get_dns_stats_handler),
 };
 
 static struct ubus_object_type classifi_obj_type =
