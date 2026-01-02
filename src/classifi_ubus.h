@@ -19,5 +19,7 @@
 int classifi_ubus_init(struct classifi_ctx *ctx);
 int discover_interfaces_from_uci(const char **iface_names, int max_ifaces);
 int reload_config(struct classifi_ctx *ctx, int *out_added, int *out_removed);
+int rules_load_from_uci(struct classifi_ctx *ctx);
+void rules_free(struct classifi_ctx *ctx);
 
 #endif /* CLASSIFI_UBUS_H */

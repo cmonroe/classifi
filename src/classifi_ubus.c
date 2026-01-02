@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <regex.h>
 #include <libubox/blobmsg.h>
 #include <libubus.h>
 #include <uci.h>
@@ -22,6 +23,7 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <linux/if_link.h>
+#include <linux/in.h>
 #include <ndpi/ndpi_api.h>
 
 #include "classifi_ubus.h"
@@ -117,6 +119,169 @@ discover_interfaces_from_uci(const char **iface_names, int max_ifaces)
 
 	uci_unload(ctx, pkg);
 	uci_free_context(ctx);
+
+	return count;
+}
+
+void
+rules_free(struct classifi_ctx *ctx)
+{
+	struct classifi_rule *rule = ctx->rules;
+
+	while (rule) {
+		struct classifi_rule *next = rule->next;
+
+		if (rule->regex_compiled)
+			regfree(&rule->regex);
+		free(rule);
+		rule = next;
+	}
+
+	ctx->rules = NULL;
+	ctx->num_rules = 0;
+}
+
+int
+rules_load_from_uci(struct classifi_ctx *ctx)
+{
+	struct uci_context *uci;
+	struct uci_package *pkg;
+	struct uci_element *e;
+	struct uci_section *s;
+	const char *name, *dst_ip, *dst_port_str, *protocol, *pattern, *script;
+	const char *enabled, *host_header;
+	struct classifi_rule *rule, *tail = NULL;
+	int count = 0;
+
+	rules_free(ctx);
+
+	uci = uci_alloc_context();
+	if (!uci) {
+		fprintf(stderr, "failed to allocate UCI context for rules\n");
+		return -1;
+	}
+
+	if (uci_load(uci, "classifi", &pkg) != UCI_OK) {
+		if (ctx->verbose)
+			fprintf(stderr, "no classifi UCI config found, no rules loaded\n");
+		uci_free_context(uci);
+		return 0;
+	}
+
+	uci_foreach_element(&pkg->sections, e) {
+		s = uci_to_section(e);
+
+		if (strcmp(s->type, "rule") != 0)
+			continue;
+
+		if (count >= MAX_RULES) {
+			fprintf(stderr, "maximum number of rules (%d) reached\n", MAX_RULES);
+			break;
+		}
+
+		enabled = uci_get_option_string(s, "enabled");
+		if (enabled && strcmp(enabled, "0") == 0)
+			continue;
+
+		name = uci_get_option_string(s, "name");
+		dst_ip = uci_get_option_string(s, "dst_ip");
+		dst_port_str = uci_get_option_string(s, "dst_port");
+		pattern = uci_get_option_string(s, "pattern");
+		host_header = uci_get_option_string(s, "host_header");
+
+		if (!name || !dst_port_str || !pattern) {
+			fprintf(stderr, "rule '%s' missing required fields (name, dst_port, pattern)\n",
+				s->e.name);
+			continue;
+		}
+
+		if (!dst_ip && !host_header) {
+			fprintf(stderr, "rule '%s' must have at least dst_ip or host_header\n",
+				s->e.name);
+			continue;
+		}
+
+		rule = calloc(1, sizeof(*rule));
+		if (!rule) {
+			fprintf(stderr, "failed to allocate rule\n");
+			continue;
+		}
+
+		snprintf(rule->name, sizeof(rule->name), "%s", name);
+		rule->enabled = 1;
+		rule->dst_port = (__u16)atoi(dst_port_str);
+
+		if (dst_ip) {
+			if (inet_pton(AF_INET, dst_ip, &rule->dst_ip.lo) == 1) {
+				rule->dst_family = FLOW_FAMILY_IPV4;
+				rule->dst_ip.hi = 0;
+				rule->has_dst_ip = 1;
+			} else if (inet_pton(AF_INET6, dst_ip, &rule->dst_ip) == 1) {
+				rule->dst_family = FLOW_FAMILY_IPV6;
+				rule->has_dst_ip = 1;
+			} else {
+				fprintf(stderr, "rule '%s': invalid dst_ip '%s'\n", name, dst_ip);
+				free(rule);
+				continue;
+			}
+		}
+
+		if (host_header)
+			snprintf(rule->host_header, sizeof(rule->host_header), "%s", host_header);
+
+		protocol = uci_get_option_string(s, "protocol");
+		if (!protocol || strcmp(protocol, "tcp") == 0)
+			rule->protocol = IPPROTO_TCP;
+		else if (strcmp(protocol, "udp") == 0)
+			rule->protocol = IPPROTO_UDP;
+		else {
+			fprintf(stderr, "rule '%s': unknown protocol '%s', using tcp\n", name, protocol);
+			rule->protocol = IPPROTO_TCP;
+		}
+
+		snprintf(rule->pattern, sizeof(rule->pattern), "%s", pattern);
+		if (regcomp(&rule->regex, pattern, REG_EXTENDED) != 0) {
+			fprintf(stderr, "rule '%s': failed to compile pattern '%s'\n", name, pattern);
+			free(rule);
+			continue;
+		}
+		rule->regex_compiled = 1;
+
+		script = uci_get_option_string(s, "script");
+		if (script)
+			snprintf(rule->script, sizeof(rule->script), "%s", script);
+
+		if (!ctx->rules)
+			ctx->rules = rule;
+		else
+			tail->next = rule;
+		tail = rule;
+		count++;
+
+		if (ctx->verbose) {
+			char ip_str[INET6_ADDRSTRLEN] = "any";
+			if (rule->has_dst_ip) {
+				if (rule->dst_family == FLOW_FAMILY_IPV4) {
+					uint32_t ip = (uint32_t)rule->dst_ip.lo;
+					inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
+				} else {
+					inet_ntop(AF_INET6, &rule->dst_ip, ip_str, sizeof(ip_str));
+				}
+			}
+			fprintf(stderr, "loaded rule '%s': %s:%u%s%s pattern='%s'%s\n",
+				rule->name, ip_str, rule->dst_port,
+				rule->host_header[0] ? " host=" : "",
+				rule->host_header[0] ? rule->host_header : "",
+				rule->pattern,
+				rule->script[0] ? " (with script)" : "");
+		}
+	}
+
+	uci_unload(uci, pkg);
+	uci_free_context(uci);
+
+	ctx->num_rules = count;
+	printf("loaded %d rule(s) from UCI config\n", count);
 
 	return count;
 }
@@ -318,6 +483,8 @@ reload_config(struct classifi_ctx *ctx, int *out_added, int *out_removed)
 	printf("config reload: %d added, %d removed, %d total\n",
 	       added, removed, ctx->num_interfaces);
 
+	rules_load_from_uci(ctx);
+
 	if (out_added)
 		*out_added = added;
 	if (out_removed)
@@ -467,7 +634,6 @@ classifi_status_handler(struct ubus_context *uctx, struct ubus_object *obj,
 
 	blobmsg_add_string(&b, "mode", g_ctx->pcap_mode ? "pcap" : "ebpf");
 	blobmsg_add_u8(&b, "verbose", g_ctx->verbose);
-	blobmsg_add_u8(&b, "suppress_noisy", g_ctx->suppress_noisy);
 	blobmsg_add_u8(&b, "periodic_stats", g_ctx->periodic_stats);
 
 	if (g_ctx->ringbuf_stats_fd >= 0)
@@ -499,6 +665,44 @@ classifi_status_handler(struct ubus_context *uctx, struct ubus_object *obj,
 		blobmsg_close_table(&b, iface_obj);
 	}
 	blobmsg_close_array(&b, ifaces);
+
+	void *rules = blobmsg_open_array(&b, "rules");
+	struct classifi_rule *rule;
+	for (rule = g_ctx->rules; rule; rule = rule->next) {
+		void *rule_obj = blobmsg_open_table(&b, NULL);
+
+		blobmsg_add_string(&b, "name", rule->name);
+		blobmsg_add_u8(&b, "enabled", rule->enabled);
+
+		if (rule->has_dst_ip) {
+			if (rule->dst_family == FLOW_FAMILY_IPV4) {
+				uint32_t ip = (uint32_t)rule->dst_ip.lo;
+				inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
+			} else {
+				struct in6_addr addr;
+				memcpy(&addr, &rule->dst_ip, sizeof(addr));
+				inet_ntop(AF_INET6, &addr, ip_str, sizeof(ip_str));
+			}
+			blobmsg_add_string(&b, "dst_ip", ip_str);
+		}
+
+		if (rule->host_header[0])
+			blobmsg_add_string(&b, "host_header", rule->host_header);
+
+		blobmsg_add_u32(&b, "dst_port", rule->dst_port);
+		blobmsg_add_string(&b, "protocol", rule->protocol == IPPROTO_TCP ? "tcp" : "udp");
+		blobmsg_add_string(&b, "pattern", rule->pattern);
+
+		if (rule->script[0])
+			blobmsg_add_string(&b, "script", rule->script);
+
+		blobmsg_add_u64(&b, "hits", rule->hits);
+
+		blobmsg_close_table(&b, rule_obj);
+	}
+	blobmsg_close_array(&b, rules);
+
+	blobmsg_add_u32(&b, "num_rules", g_ctx->num_rules);
 
 	ubus_send_reply(uctx, req, b.head);
 	blob_buf_free(&b);

@@ -13,4 +13,16 @@ uci -q batch <<-EOF
 	set classifi.config.enabled='1'
 EOF
 
+# Example rule configuration (uncomment to enable):
+# uci -q batch <<-EOF
+# 	set classifi.session_example='rule'
+# 	set classifi.session_example.enabled='1'
+# 	set classifi.session_example.name='http_session_capture'
+# 	set classifi.session_example.dst_ip='100.87.210.25'
+# 	set classifi.session_example.dst_port='8080'
+# 	set classifi.session_example.protocol='tcp'
+# 	set classifi.session_example.pattern='POST /start_session/([a-f0-9-]+) HTTP'
+# 	set classifi.session_example.script='/usr/libexec/classifi/session_handler.sh'
+# EOF
+
 exit 0

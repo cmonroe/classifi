@@ -16,12 +16,40 @@
 
 #include <stdint.h>
 #include <time.h>
+#include <regex.h>
 #include <ndpi/ndpi_api.h>
 #include <bpf/libbpf.h>
 #include <libubox/uloop.h>
 #include <libubus.h>
 
 #include "classifi_bpf.h"
+
+#define MAX_RULES 32
+#define MAX_PATTERN_LEN 256
+#define MAX_EXTRACTS 4
+
+struct classifi_rule {
+	char name[64];
+	int enabled;
+
+	struct flow_addr dst_ip;
+	__u8 dst_family;
+	__u16 dst_port;
+	__u8 protocol;
+	int has_dst_ip;
+
+	char host_header[128];
+
+	char pattern[MAX_PATTERN_LEN];
+	regex_t regex;
+	int regex_compiled;
+
+	char script[128];
+
+	uint64_t hits;
+
+	struct classifi_rule *next;
+};
 
 static inline uint64_t monotonic_time_sec(void)
 {
@@ -64,6 +92,7 @@ struct ndpi_flow {
 	char os_hint[32];
 	int protocol_stack_count;
 	u_int16_t protocol_stack[8];
+	__u32 rules_matched;
 	struct ndpi_flow *next;
 };
 
@@ -74,6 +103,9 @@ struct classifi_ctx {
 
 	struct interface_info interfaces[MAX_INTERFACES];
 	int num_interfaces;
+
+	struct classifi_rule *rules;
+	int num_rules;
 
 	struct bpf_object *bpf_obj;
 	int bpf_prog_fd;
@@ -90,7 +122,6 @@ struct classifi_ctx {
 	int verbose;
 	int periodic_stats;
 	int pcap_mode;
-	int suppress_noisy;
 
 	const char *pcap_ifname;
 

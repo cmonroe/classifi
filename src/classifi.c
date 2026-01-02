@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <ctype.h>
 #include <time.h>
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
@@ -34,8 +35,10 @@
 #include <linux/udp.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <ifaddrs.h>
+#include <regex.h>
 #include <libubox/uloop.h>
 #include <libubox/blobmsg.h>
 #include <libubus.h>
@@ -592,6 +595,286 @@ static void emit_dns_event(struct classifi_ctx *ctx, const char *client_ip, cons
 	blob_buf_free(&b);
 }
 
+static int get_tcp_payload(struct packet_sample *sample, char *buf, size_t buf_len)
+{
+	unsigned char *ip_packet;
+	unsigned int ip_hdr_len, tcp_hdr_len;
+	unsigned char *tcp_hdr;
+	unsigned char *payload;
+	unsigned int payload_len;
+	unsigned int l3_offset = sample->l3_offset;
+
+	if (l3_offset >= sample->data_len)
+		return -1;
+
+	ip_packet = sample->data + l3_offset;
+
+	if (sample->key.family == FLOW_FAMILY_IPV4) {
+		struct iphdr *iph = (struct iphdr *)ip_packet;
+
+		if (l3_offset + sizeof(struct iphdr) > sample->data_len)
+			return -1;
+		if (iph->protocol != IPPROTO_TCP)
+			return -1;
+
+		ip_hdr_len = iph->ihl * 4;
+		if (l3_offset + ip_hdr_len > sample->data_len)
+			return -1;
+
+		tcp_hdr = ip_packet + ip_hdr_len;
+	} else if (sample->key.family == FLOW_FAMILY_IPV6) {
+		struct ipv6hdr *ip6h = (struct ipv6hdr *)ip_packet;
+
+		if (l3_offset + sizeof(struct ipv6hdr) > sample->data_len)
+			return -1;
+		if (ip6h->nexthdr != IPPROTO_TCP)
+			return -1;
+
+		ip_hdr_len = sizeof(struct ipv6hdr);
+		tcp_hdr = ip_packet + ip_hdr_len;
+	} else {
+		return -1;
+	}
+
+	if (l3_offset + ip_hdr_len + sizeof(struct tcphdr) > sample->data_len)
+		return -1;
+
+	struct tcphdr *tcph = (struct tcphdr *)tcp_hdr;
+	tcp_hdr_len = tcph->doff * 4;
+
+	if (l3_offset + ip_hdr_len + tcp_hdr_len > sample->data_len)
+		return -1;
+
+	payload = tcp_hdr + tcp_hdr_len;
+	payload_len = sample->data_len - l3_offset - ip_hdr_len - tcp_hdr_len;
+
+	if (payload_len == 0)
+		return -1;
+
+	size_t copy_len = payload_len < buf_len - 1 ? payload_len : buf_len - 1;
+	memcpy(buf, payload, copy_len);
+	buf[copy_len] = '\0';
+
+	return (int)copy_len;
+}
+
+static void emit_rule_match_event(struct classifi_ctx *ctx,
+				  struct classifi_rule *rule,
+				  struct flow_key *key,
+				  char extracts[][256],
+				  int num_extracts,
+				  const char *ifname)
+{
+	struct blob_buf b = {};
+	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
+
+	if (!ctx->ubus_ctx)
+		return;
+
+	flow_key_to_strings(key, src_ip, sizeof(src_ip), dst_ip, sizeof(dst_ip));
+
+	blob_buf_init(&b, 0);
+	blobmsg_add_string(&b, "rule", rule->name);
+	blobmsg_add_string(&b, "interface", ifname ? ifname : "unknown");
+	blobmsg_add_string(&b, "src_ip", src_ip);
+	blobmsg_add_u32(&b, "src_port", key->src_port);
+	blobmsg_add_string(&b, "dst_ip", dst_ip);
+	blobmsg_add_u32(&b, "dst_port", key->dst_port);
+	blobmsg_add_u32(&b, "protocol", key->protocol);
+
+	for (int i = 0; i < num_extracts && i < MAX_EXTRACTS; i++) {
+		char field_name[16];
+		snprintf(field_name, sizeof(field_name), "match_%d", i + 1);
+		blobmsg_add_string(&b, field_name, extracts[i]);
+	}
+
+	if (ubus_send_event(ctx->ubus_ctx, "classifi.rule_match", b.head) != 0) {
+		if (ctx->verbose)
+			fprintf(stderr, "failed to send rule match event for rule '%s'\n", rule->name);
+	}
+
+	blob_buf_free(&b);
+}
+
+static void sanitize_for_shell(char *str)
+{
+	char *src = str, *dst = str;
+
+	while (*src) {
+		if (isalnum((unsigned char)*src) ||
+		    *src == '-' || *src == '_' ||
+		    *src == '.' || *src == ':' || *src == '/')
+			*dst++ = *src;
+		src++;
+	}
+	*dst = '\0';
+}
+
+static void execute_rule_script(struct classifi_ctx *ctx,
+				struct classifi_rule *rule,
+				struct flow_key *key,
+				char extracts[][256],
+				int num_extracts,
+				const char *ifname)
+{
+	pid_t pid;
+	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
+	char port_str[8], proto_str[8];
+	char safe_extracts[MAX_EXTRACTS][256];
+
+	if (!rule->script[0])
+		return;
+
+	for (int i = 0; i < num_extracts && i < MAX_EXTRACTS; i++) {
+		memcpy(safe_extracts[i], extracts[i], sizeof(safe_extracts[i]));
+		sanitize_for_shell(safe_extracts[i]);
+	}
+
+	flow_key_to_strings(key, src_ip, sizeof(src_ip), dst_ip, sizeof(dst_ip));
+	snprintf(port_str, sizeof(port_str), "%u", key->dst_port);
+	snprintf(proto_str, sizeof(proto_str), "%u", key->protocol);
+
+	pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "failed to fork for rule script '%s': %s\n",
+			rule->script, strerror(errno));
+		return;
+	}
+
+	if (pid == 0) {
+		setenv("CLASSIFI_RULE", rule->name, 1);
+		setenv("CLASSIFI_INTERFACE", ifname ? ifname : "unknown", 1);
+		setenv("CLASSIFI_SRC_IP", src_ip, 1);
+		setenv("CLASSIFI_DST_IP", dst_ip, 1);
+		setenv("CLASSIFI_DST_PORT", port_str, 1);
+		setenv("CLASSIFI_PROTOCOL", proto_str, 1);
+
+		for (int i = 0; i < num_extracts && i < MAX_EXTRACTS; i++) {
+			char env_name[32];
+			snprintf(env_name, sizeof(env_name), "CLASSIFI_MATCH_%d", i + 1);
+			setenv(env_name, safe_extracts[i], 1);
+		}
+
+		execl("/bin/sh", "sh", "-c", rule->script, NULL);
+		_exit(127);
+	}
+}
+
+static int ip_addr_match(struct flow_addr *a, struct flow_addr *b, __u8 family)
+{
+	if (family == FLOW_FAMILY_IPV4)
+		return a->lo == b->lo;
+	return a->hi == b->hi && a->lo == b->lo;
+}
+
+static int host_header_match(const char *payload, const char *expected_host)
+{
+	const char *host_start;
+	const char *line_end;
+	size_t host_len;
+
+	host_start = strstr(payload, "Host: ");
+	if (!host_start)
+		host_start = strstr(payload, "host: ");
+	if (!host_start)
+		return 0;
+
+	host_start += 6;
+
+	line_end = strpbrk(host_start, "\r\n");
+	if (!line_end)
+		line_end = host_start + strlen(host_start);
+
+	host_len = strlen(expected_host);
+
+	if ((size_t)(line_end - host_start) < host_len)
+		return 0;
+
+	if (strncasecmp(host_start, expected_host, host_len) != 0)
+		return 0;
+
+	if (host_start[host_len] == ':' || host_start[host_len] == '\r' ||
+	    host_start[host_len] == '\n' || host_start[host_len] == '\0')
+		return 1;
+
+	return 0;
+}
+
+static void check_rules_and_execute(struct classifi_ctx *ctx,
+				    struct ndpi_flow *flow,
+				    struct flow_key *packet_view,
+				    struct packet_sample *sample,
+				    const char *ifname)
+{
+	struct classifi_rule *rule;
+	int rule_idx = 0;
+	char payload_buf[1024];
+	int payload_len;
+
+	if (!ctx->rules)
+		return;
+
+	payload_len = get_tcp_payload(sample, payload_buf, sizeof(payload_buf));
+	if (payload_len <= 0)
+		return;
+
+	for (rule = ctx->rules; rule && rule_idx < MAX_RULES; rule = rule->next, rule_idx++) {
+		regmatch_t matches[MAX_EXTRACTS + 1];
+		char extracts[MAX_EXTRACTS][256];
+		int num_extracts = 0;
+
+		if (!rule->enabled)
+			continue;
+
+		if (flow->rules_matched & (1u << rule_idx))
+			continue;
+
+		if (packet_view->dst_port != rule->dst_port)
+			continue;
+
+		if (packet_view->protocol != rule->protocol)
+			continue;
+
+		if (rule->has_dst_ip) {
+			if (packet_view->family != rule->dst_family)
+				continue;
+			if (!ip_addr_match(&packet_view->dst, &rule->dst_ip, rule->dst_family))
+				continue;
+		}
+
+		if (rule->host_header[0]) {
+			if (!host_header_match(payload_buf, rule->host_header))
+				continue;
+		}
+
+		if (regexec(&rule->regex, payload_buf, MAX_EXTRACTS + 1, matches, 0) != 0)
+			continue;
+
+		flow->rules_matched |= (1u << rule_idx);
+		rule->hits++;
+
+		for (int i = 1; i <= MAX_EXTRACTS && matches[i].rm_so >= 0; i++) {
+			int len = matches[i].rm_eo - matches[i].rm_so;
+			if (len > 255)
+				len = 255;
+			memcpy(extracts[num_extracts], payload_buf + matches[i].rm_so, len);
+			extracts[num_extracts][len] = '\0';
+			num_extracts++;
+		}
+
+		if (ctx->verbose)
+			fprintf(stderr, "rule '%s' matched flow to %s:%u, %d capture(s)\n",
+				rule->name,
+				ifname ? ifname : "unknown",
+				rule->dst_port, num_extracts);
+
+		emit_rule_match_event(ctx, rule, packet_view, extracts, num_extracts, ifname);
+
+		if (rule->script[0])
+			execute_rule_script(ctx, rule, packet_view, extracts, num_extracts, ifname);
+	}
+}
+
 static struct ndpi_detection_module_struct *setup_ndpi(void)
 {
 	struct ndpi_detection_module_struct *ndpi_struct;
@@ -680,6 +963,9 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		flow->packets_dir0++;
 	else
 		flow->packets_dir1++;
+
+	check_rules_and_execute(ctx, flow, &packet_view, sample,
+				interface_name_by_index(ctx, sample->ifindex));
 
 	if (ctx->verbose) {
 		fprintf(stderr, "sample %d (flow pkt %d, dir=%u): %s:%u -> %s:%u proto=%u len=%u l3_off=%u [dir0=%d dir1=%d]\n",
@@ -1068,16 +1354,6 @@ static void print_classified_flows(struct classifi_ctx *ctx)
 					master_name = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.master_protocol);
 				app_name = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.app_protocol);
 
-				if (ctx->suppress_noisy) {
-					if (flow->protocol.proto.app_protocol == NDPI_PROTOCOL_DNS ||
-					    summary_key.protocol == IPPROTO_ICMP ||
-					    summary_key.protocol == IPPROTO_ICMPV6 ||
-					    summary_key.protocol == 2) {
-						flow = flow->next;
-						continue;
-					}
-				}
-
 				const char *category_name = ndpi_category_get_name(ctx->ndpi, flow->protocol.category);
 
 				printf("%-39s:%-5u -> %-39s:%-5u proto=%-3u | %-8s / %-20s | %-16s | pkts=%d (d0:%d d1:%d) age=%llus\n",
@@ -1462,7 +1738,7 @@ int main(int argc, char **argv)
 	int discover_mode = 0;
 	int opt_idx = 1;
 
-	ctx.suppress_noisy = 1;
+	signal(SIGCHLD, SIG_IGN);
 
 	while (opt_idx < argc && argv[opt_idx][0] == '-') {
 		if (strcmp(argv[opt_idx], "-v") == 0 ||
@@ -1476,10 +1752,6 @@ int main(int argc, char **argv)
 		} else if (strcmp(argv[opt_idx], "-p") == 0 ||
 		           strcmp(argv[opt_idx], "--pcap") == 0) {
 			ctx.pcap_mode = 1;
-			opt_idx++;
-		} else if (strcmp(argv[opt_idx], "-n") == 0 ||
-		           strcmp(argv[opt_idx], "--noisy") == 0) {
-			ctx.suppress_noisy = 0;
 			opt_idx++;
 		} else if (strcmp(argv[opt_idx], "-i") == 0 ||
 		           strcmp(argv[opt_idx], "--interface") == 0) {
@@ -1543,6 +1815,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "failed to initialize nDPI\n");
 		return 1;
 	}
+
+	rules_load_from_uci(&ctx);
 
 	if (ctx.pcap_mode) {
 		ctx.pcap_ifname = iface_names[0];
@@ -1636,6 +1910,7 @@ cleanup:
 	ctx.ringbuf = NULL;
 	bpf_object__close(ctx.bpf_obj);
 	cleanup_flow_table(&ctx);
+	rules_free(&ctx);
 	if (ctx.ndpi)
 		ndpi_exit_detection_module(ctx.ndpi);
 
