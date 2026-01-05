@@ -576,6 +576,21 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 	if (flow->os_hint[0])
 		blobmsg_add_string(b, "os_hint", flow->os_hint);
 
+	if (flow->risk) {
+		void *risks_array;
+
+		blobmsg_add_u32(b, "risk_score", flow->risk_score);
+		blobmsg_add_u32(b, "risk_score_client", flow->risk_score_client);
+		blobmsg_add_u32(b, "risk_score_server", flow->risk_score_server);
+
+		risks_array = blobmsg_open_array(b, "risks");
+		for (int i = 0; i < 64; i++) {
+			if (flow->risk & (1ULL << i))
+				blobmsg_add_string(b, NULL, ndpi_risk2str((ndpi_risk_enum)i));
+		}
+		blobmsg_close_array(b, risks_array);
+	}
+
 	if (flow->protocol_stack_count > 1) {
 		int stack_count = flow->protocol_stack_count;
 		if (stack_count > 8)

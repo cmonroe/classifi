@@ -93,6 +93,12 @@ struct ndpi_flow {
 	int protocol_stack_count;
 	u_int16_t protocol_stack[8];
 	__u32 rules_matched;
+
+	ndpi_risk risk;
+	u_int16_t risk_score;
+	u_int16_t risk_score_client;
+	u_int16_t risk_score_server;
+
 	struct ndpi_flow *next;
 };
 

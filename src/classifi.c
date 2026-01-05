@@ -563,6 +563,19 @@ static void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow
 		blobmsg_close_array(&b, stack);
 	}
 
+	if (flow->risk) {
+		blobmsg_add_u32(&b, "risk_score", flow->risk_score);
+		blobmsg_add_u32(&b, "risk_score_client", flow->risk_score_client);
+		blobmsg_add_u32(&b, "risk_score_server", flow->risk_score_server);
+
+		void *risks = blobmsg_open_array(&b, "risks");
+		for (int i = 0; i < 64; i++) {
+			if (flow->risk & (1ULL << i))
+				blobmsg_add_string(&b, NULL, ndpi_risk2str((ndpi_risk_enum)i));
+		}
+		blobmsg_close_array(&b, risks);
+	}
+
 	if (ubus_send_event(ctx->ubus_ctx, "classifi.classified", b.head) != 0) {
 		if (ctx->verbose)
 			fprintf(stderr, "failed to send ubus event for flow %s:%u -> %s:%u\n",
@@ -1025,6 +1038,12 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		flow->protocol_stack_count = stack_count;
 		for (int i = 0; i < stack_count; i++)
 			flow->protocol_stack[i] = protocol.protocol_stack.protos[i];
+	}
+
+	flow->risk = flow->flow->risk;
+	if (flow->risk) {
+		flow->risk_score = ndpi_risk2score(flow->risk,
+			&flow->risk_score_client, &flow->risk_score_server);
 	}
 
 	if (ctx->verbose) {
