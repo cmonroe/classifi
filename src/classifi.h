@@ -101,6 +101,8 @@ struct ndpi_flow {
 
 	u_int8_t multimedia_types;
 
+	struct ndpi_flow_input_info input_info;
+
 	struct ndpi_flow *next;
 };
 

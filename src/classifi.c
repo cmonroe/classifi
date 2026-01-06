@@ -945,7 +945,6 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	ndpi_protocol protocol;
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
 	struct flow_key packet_view;
-	struct ndpi_flow_input_info input_info = {0};
 	static int total_samples = 0;
 
 	total_samples++;
@@ -1006,9 +1005,6 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		}
 	}
 
-	input_info.in_pkt_dir = sample->direction ? 1 : 0;
-	input_info.seen_flow_beginning = (flow->packets_processed == 1);
-
 	unsigned int l3_offset = sample->l3_offset;
 	unsigned char *ip_packet = NULL;
 	unsigned int ip_packet_len = 0;
@@ -1028,7 +1024,7 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 
 	protocol = ndpi_detection_process_packet(
 		ctx->ndpi, flow->flow, ip_packet, ip_packet_len,
-		time_ms, &input_info);
+		time_ms, &flow->input_info);
 
 	if (flow->flow->tcp.fingerprint && flow->flow->tcp.fingerprint[0] &&
 	    !flow->tcp_fingerprint[0]) {
@@ -1484,7 +1480,6 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 	struct ndpi_flow *flow;
 	ndpi_protocol protocol;
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
-	struct ndpi_flow_input_info input_info = {0};
 	static unsigned long long total_packets = 0;
 
 	total_packets++;
@@ -1539,9 +1534,6 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 	if (flow->detection_finalized)
 		return;
 
-	input_info.in_pkt_dir = direction ? 1 : 0;
-	input_info.seen_flow_beginning = (flow->packets_processed == 1);
-
 	if (!l3_data || l3_len == 0) {
 		if (ctx->verbose)
 			fprintf(stderr, "  no L3 data, skipping nDPI\n");
@@ -1552,7 +1544,7 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 
 	protocol = ndpi_detection_process_packet(
 		ctx->ndpi, flow->flow, l3_data, l3_len,
-		time_ms, &input_info);
+		time_ms, &flow->input_info);
 
 	if (flow->flow->tcp.fingerprint && flow->flow->tcp.fingerprint[0] &&
 	    !flow->tcp_fingerprint[0]) {
