@@ -576,6 +576,13 @@ static void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow
 		blobmsg_close_array(&b, risks);
 	}
 
+	if (flow->multimedia_types) {
+		char stream_content[64];
+		if (ndpi_multimedia_flowtype2str(stream_content, sizeof(stream_content),
+						 flow->multimedia_types))
+			blobmsg_add_string(&b, "stream_content", stream_content);
+	}
+
 	if (ubus_send_event(ctx->ubus_ctx, "classifi.classified", b.head) != 0) {
 		if (ctx->verbose)
 			fprintf(stderr, "failed to send ubus event for flow %s:%u -> %s:%u\n",
@@ -1046,6 +1053,8 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 			&flow->risk_score_client, &flow->risk_score_server);
 	}
 
+	flow->multimedia_types = flow->flow->flow_multimedia_types;
+
 	if (ctx->verbose) {
 		fprintf(stderr, "  [PKT %d] nDPI process_packet: master=%u (%s) app=%u (%s) category=%s state=%d\n",
 			flow->packets_processed,
@@ -1068,6 +1077,13 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 					ndpi_get_proto_name(ctx->ndpi, flow->protocol_stack[i]));
 			}
 			fprintf(stderr, "\n");
+		}
+
+		if (flow->multimedia_types) {
+			char stream_content[64];
+			if (ndpi_multimedia_flowtype2str(stream_content, sizeof(stream_content),
+							 flow->multimedia_types))
+				fprintf(stderr, "  [Stream] %s\n", stream_content);
 		}
 
 		if (protocol.proto.app_protocol == NDPI_PROTOCOL_TLS && flow->packets_processed <= 10) {
@@ -1555,6 +1571,8 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 			flow->protocol_stack[i] = protocol.protocol_stack.protos[i];
 	}
 
+	flow->multimedia_types = flow->flow->flow_multimedia_types;
+
 	if (ctx->verbose && (flow->packets_processed <= 50 || flow->packets_processed % 20 == 0)) {
 		fprintf(stderr, "  [PKT %d] nDPI process_packet: master=%u (%s) app=%u (%s) category=%s state=%d\n",
 			flow->packets_processed,
@@ -1577,6 +1595,13 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 					ndpi_get_proto_name(ctx->ndpi, flow->protocol_stack[i]));
 			}
 			fprintf(stderr, "\n");
+		}
+
+		if (flow->multimedia_types) {
+			char stream_content[64];
+			if (ndpi_multimedia_flowtype2str(stream_content, sizeof(stream_content),
+							 flow->multimedia_types))
+				fprintf(stderr, "  [Stream] %s\n", stream_content);
 		}
 
 		if (protocol.proto.app_protocol == NDPI_PROTOCOL_TLS && flow->packets_processed <= 10) {

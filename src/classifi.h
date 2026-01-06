@@ -99,6 +99,8 @@ struct ndpi_flow {
 	u_int16_t risk_score_client;
 	u_int16_t risk_score_server;
 
+	u_int8_t multimedia_types;
+
 	struct ndpi_flow *next;
 };
 

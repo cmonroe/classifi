@@ -601,6 +601,13 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 		blobmsg_close_array(b, stack_array);
 	}
 
+	if (flow->multimedia_types) {
+		char stream_content[64];
+		if (ndpi_multimedia_flowtype2str(stream_content, sizeof(stream_content),
+						 flow->multimedia_types))
+			blobmsg_add_string(b, "stream_content", stream_content);
+	}
+
 	blobmsg_close_table(b, flow_obj);
 	fbc->count++;
 }
