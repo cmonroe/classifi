@@ -575,6 +575,8 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 		blobmsg_add_string(b, "tcp_fingerprint", flow->tcp_fingerprint);
 	if (flow->os_hint[0])
 		blobmsg_add_string(b, "os_hint", flow->os_hint);
+	if (flow->flow->host_server_name[0])
+		blobmsg_add_string(b, "hostname", flow->flow->host_server_name);
 
 	if (flow->risk) {
 		void *risks_array;

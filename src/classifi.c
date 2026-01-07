@@ -555,6 +555,8 @@ static void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow
 		blobmsg_add_string(&b, "tcp_fingerprint", flow->tcp_fingerprint);
 	if (flow->os_hint[0])
 		blobmsg_add_string(&b, "os_hint", flow->os_hint);
+	if (flow->flow->host_server_name[0])
+		blobmsg_add_string(&b, "hostname", flow->flow->host_server_name);
 
 	if (flow->protocol_stack_count > 1) {
 		void *stack = blobmsg_open_array(&b, "protocol_stack");
@@ -563,7 +565,7 @@ static void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow
 		blobmsg_close_array(&b, stack);
 	}
 
-	if (flow->risk) {
+	if (flow->risk_score >= NDPI_SCORE_RISK_HIGH) {
 		blobmsg_add_u32(&b, "risk_score", flow->risk_score);
 		blobmsg_add_u32(&b, "risk_score_client", flow->risk_score_client);
 		blobmsg_add_u32(&b, "risk_score_server", flow->risk_score_server);
@@ -1124,7 +1126,8 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 
 	if (!flow->detection_finalized &&
 	    (protocol.state == NDPI_STATE_CLASSIFIED ||
-	     protocol.state == NDPI_STATE_MONITORING)) {
+	     protocol.state == NDPI_STATE_MONITORING) &&
+	    flow->flow->extra_packets_func == NULL) {
 		flow->detection_finalized = 1;
 		if (ctx->verbose) {
 			fprintf(stderr, "  [PKT %d] Flow finalized via nDPI state=%d\n",
@@ -1638,7 +1641,8 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 
 	if (!flow->detection_finalized &&
 	    (protocol.state == NDPI_STATE_CLASSIFIED ||
-	     protocol.state == NDPI_STATE_MONITORING)) {
+	     protocol.state == NDPI_STATE_MONITORING) &&
+	    flow->flow->extra_packets_func == NULL) {
 		flow->detection_finalized = 1;
 		if (ctx->verbose) {
 			fprintf(stderr, "  [PKT %d] Flow finalized via nDPI state=%d\n",
