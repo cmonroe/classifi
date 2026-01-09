@@ -516,6 +516,24 @@ int get_interface_ip(struct interface_info *iface)
 	return found ? 0 : -1;
 }
 
+static int tls_quic_metadata_ready(struct ndpi_flow *flow)
+{
+	u_int16_t master = flow->protocol.proto.master_protocol;
+	u_int16_t app = flow->protocol.proto.app_protocol;
+
+	if (master != NDPI_PROTOCOL_TLS && master != NDPI_PROTOCOL_QUIC &&
+	    app != NDPI_PROTOCOL_TLS && app != NDPI_PROTOCOL_QUIC)
+		return 1;
+
+	if (flow->detection_finalized)
+		return 1;
+
+	if (flow->flow->protos.tls_quic.client_hello_processed)
+		return 1;
+
+	return 0;
+}
+
 static void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow, const char *ifname)
 {
 	struct blob_buf b = {};
@@ -1022,11 +1040,67 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		return;
 	}
 
+	if (ctx->verbose && flow->packets_processed <= 5) {
+		uint8_t ip_version = (ip_packet[0] >> 4) & 0x0f;
+		if (ip_version == 4 && ip_packet_len >= 20) {
+			struct iphdr *iph = (struct iphdr *)ip_packet;
+			char pkt_src[INET_ADDRSTRLEN], pkt_dst[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &iph->saddr, pkt_src, sizeof(pkt_src));
+			inet_ntop(AF_INET, &iph->daddr, pkt_dst, sizeof(pkt_dst));
+			fprintf(stderr, "  [IP HDR] ver=%u src=%s dst=%s proto=%u bpf_dir=%u (flow_view: %s -> %s)\n",
+				ip_version, pkt_src, pkt_dst, iph->protocol, sample->direction, src_ip, dst_ip);
+		} else if (ip_version == 6 && ip_packet_len >= 40) {
+			struct ipv6hdr *ip6h = (struct ipv6hdr *)ip_packet;
+			char pkt_src[INET6_ADDRSTRLEN], pkt_dst[INET6_ADDRSTRLEN];
+			inet_ntop(AF_INET6, &ip6h->saddr, pkt_src, sizeof(pkt_src));
+			inet_ntop(AF_INET6, &ip6h->daddr, pkt_dst, sizeof(pkt_dst));
+			fprintf(stderr, "  [IP HDR] ver=%u src=%s dst=%s proto=%u bpf_dir=%u (flow_view: %s -> %s)\n",
+				ip_version, pkt_src, pkt_dst, ip6h->nexthdr, sample->direction, src_ip, dst_ip);
+		} else {
+			fprintf(stderr, "  [IP HDR] WARNING: invalid IP version %u at l3_offset %u\n",
+				ip_version, l3_offset);
+		}
+	}
+
 	u_int64_t time_ms = sample->ts_ns ? sample->ts_ns / 1000000ULL : monotonic_time_sec() * 1000ULL;
+
+	flow->input_info.in_pkt_dir = NDPI_IN_PKT_DIR_UNKNOWN;
 
 	protocol = ndpi_detection_process_packet(
 		ctx->ndpi, flow->flow, ip_packet, ip_packet_len,
 		time_ms, &flow->input_info);
+
+	if (flow->packets_processed <= 10) {
+		fprintf(stderr, "  [nDPI DIR] %s -> %s pkt_dir_counter[0]=%u [1]=%u client_dir=%u input_dir=%u pkt_dir=%u\n",
+			src_ip, dst_ip,
+			flow->flow->packet_direction_complete_counter[0],
+			flow->flow->packet_direction_complete_counter[1],
+			flow->flow->client_packet_direction,
+			flow->input_info.in_pkt_dir,
+			flow->flow->packet_direction);
+
+		if ((packet_view.dst_port == 443 || packet_view.src_port == 443) &&
+		    packet_view.protocol == IPPROTO_TCP) {
+			struct iphdr *iph = (struct iphdr *)ip_packet;
+			unsigned int ip_hdr_len = iph->ihl * 4;
+			struct tcphdr *tcph = (struct tcphdr *)(ip_packet + ip_hdr_len);
+			unsigned int tcp_hdr_len = tcph->doff * 4;
+			unsigned int payload_off = ip_hdr_len + tcp_hdr_len;
+			if (payload_off < ip_packet_len) {
+				const uint8_t *payload = ip_packet + payload_off;
+				unsigned int payload_len = ip_packet_len - payload_off;
+				if (payload_len >= 5) {
+					fprintf(stderr, "  [TLS RAW] %s -> %s payload_len=%u first_bytes=%02x %02x %02x %02x %02x tcp_seq=%u\n",
+						src_ip, dst_ip,
+						payload_len, payload[0], payload[1], payload[2], payload[3], payload[4],
+						ntohl(tcph->seq));
+				} else if (payload_len > 0) {
+					fprintf(stderr, "  [TLS RAW] %s -> %s payload_len=%u (too short for TLS header)\n",
+						src_ip, dst_ip, payload_len);
+				}
+			}
+		}
+	}
 
 	if (flow->flow->tcp.fingerprint && flow->flow->tcp.fingerprint[0] &&
 	    !flow->tcp_fingerprint[0]) {
@@ -1085,8 +1159,11 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		}
 
 		if (protocol.proto.app_protocol == NDPI_PROTOCOL_TLS && flow->packets_processed <= 10) {
-			fprintf(stderr, "  [TLS] dir0=%d dir1=%d sni=%s\n",
+			fprintf(stderr, "  [TLS] %s -> %s dir0=%d dir1=%d ch=%d sh=%d sni=%s\n",
+				src_ip, dst_ip,
 				flow->packets_dir0, flow->packets_dir1,
+				flow->flow->protos.tls_quic.client_hello_processed,
+				flow->flow->protos.tls_quic.server_hello_processed,
 				flow->flow->host_server_name[0] ? flow->flow->host_server_name : "NONE");
 		}
 	}
@@ -1182,8 +1259,23 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 
 		flow->protocol = protocol;
 
-		if (newly_classified)
+		if (newly_classified) {
+			if (tls_quic_metadata_ready(flow)) {
+				emit_classification_event(ctx, flow, interface_name_by_index(ctx, sample->ifindex));
+			} else {
+				flow->classification_event_pending = 1;
+				if (ctx->verbose)
+					fprintf(stderr, "  [PKT %d] Deferring event for TLS/QUIC metadata\n",
+						flow->packets_processed);
+			}
+		} else if (flow->classification_event_pending && tls_quic_metadata_ready(flow)) {
 			emit_classification_event(ctx, flow, interface_name_by_index(ctx, sample->ifindex));
+			flow->classification_event_pending = 0;
+			if (ctx->verbose)
+				fprintf(stderr, "  [PKT %d] Emitting deferred TLS/QUIC event (SNI=%s)\n",
+					flow->packets_processed,
+					flow->flow->host_server_name[0] ? flow->flow->host_server_name : "none");
+		}
 	}
 }
 
@@ -1545,6 +1637,8 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 
 	u_int64_t time_ms = pkthdr->ts.tv_sec * 1000ULL + pkthdr->ts.tv_usec / 1000ULL;
 
+	flow->input_info.in_pkt_dir = NDPI_IN_PKT_DIR_UNKNOWN;
+
 	protocol = ndpi_detection_process_packet(
 		ctx->ndpi, flow->flow, l3_data, l3_len,
 		time_ms, &flow->input_info);
@@ -1600,8 +1694,11 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 		}
 
 		if (protocol.proto.app_protocol == NDPI_PROTOCOL_TLS && flow->packets_processed <= 10) {
-			fprintf(stderr, "  [TLS] dir0=%d dir1=%d sni=%s\n",
+			fprintf(stderr, "  [TLS] %s -> %s dir0=%d dir1=%d ch=%d sh=%d sni=%s\n",
+				src_ip, dst_ip,
 				flow->packets_dir0, flow->packets_dir1,
+				flow->flow->protos.tls_quic.client_hello_processed,
+				flow->flow->protos.tls_quic.server_hello_processed,
 				flow->flow->host_server_name[0] ? flow->flow->host_server_name : "NONE");
 		}
 	}
@@ -1683,8 +1780,24 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 
 		flow->protocol = protocol;
 
-		if (newly_classified && ctx->pcap_ifname)
+		if (newly_classified && ctx->pcap_ifname) {
+			if (tls_quic_metadata_ready(flow)) {
+				emit_classification_event(ctx, flow, ctx->pcap_ifname);
+			} else {
+				flow->classification_event_pending = 1;
+				if (ctx->verbose)
+					fprintf(stderr, "  [PKT %d] Deferring event for TLS/QUIC metadata\n",
+						flow->packets_processed);
+			}
+		} else if (flow->classification_event_pending && ctx->pcap_ifname &&
+			   tls_quic_metadata_ready(flow)) {
 			emit_classification_event(ctx, flow, ctx->pcap_ifname);
+			flow->classification_event_pending = 0;
+			if (ctx->verbose)
+				fprintf(stderr, "  [PKT %d] Emitting deferred TLS/QUIC event (SNI=%s)\n",
+					flow->packets_processed,
+					flow->flow->host_server_name[0] ? flow->flow->host_server_name : "none");
+		}
 	}
 }
 
