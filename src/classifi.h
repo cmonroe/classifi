@@ -147,4 +147,26 @@ void flow_table_iterate(struct classifi_ctx *ctx,
 			flow_visitor_fn visitor,
 			void *user_data);
 
+void swap_flow_endpoints(struct flow_key *key);
+void flow_key_to_strings(const struct flow_key *key,
+			 char *src_ip, size_t src_len,
+			 char *dst_ip, size_t dst_len);
+struct ndpi_flow *flow_table_lookup(struct classifi_ctx *ctx, struct flow_key *key);
+struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *key);
+int tls_quic_metadata_ready(struct ndpi_flow *flow);
+void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			       const char *ifname);
+void emit_dns_event(struct classifi_ctx *ctx, const char *client_ip,
+		    const char *domain, uint16_t qtype, const char *ifname);
+int extract_dns_query_name(const unsigned char *dns_payload, unsigned int len,
+			   char *out, size_t out_len, uint16_t *qtype);
+void cleanup_expired_flows(struct classifi_ctx *ctx);
+
+struct interface_info *interface_by_name(struct classifi_ctx *ctx, const char *name);
+int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,
+		      const char *ifname, int discovered);
+int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface);
+
+extern volatile int keep_running;
+
 #endif /* CLASSIFI_H */
