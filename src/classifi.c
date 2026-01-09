@@ -1070,7 +1070,7 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		ctx->ndpi, flow->flow, ip_packet, ip_packet_len,
 		time_ms, &flow->input_info);
 
-	if (flow->packets_processed <= 10) {
+	if (ctx->verbose && flow->packets_processed <= 10) {
 		fprintf(stderr, "  [nDPI DIR] %s -> %s pkt_dir_counter[0]=%u [1]=%u client_dir=%u input_dir=%u pkt_dir=%u\n",
 			src_ip, dst_ip,
 			flow->flow->packet_direction_complete_counter[0],

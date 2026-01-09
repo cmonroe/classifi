@@ -16,8 +16,19 @@
 
 #include <linux/types.h>
 
+#ifndef offsetof
+#define offsetof(TYPE, MEMBER) __builtin_offsetof(TYPE, MEMBER)
+#endif
+
 #define MAX_FLOWS 8192
-#define MAX_PACKET_SAMPLE 1500
+
+/*
+ * GRO can coalesce multiple TCP segments into a single skb, producing
+ * packets larger than MTU. TLS ClientHello with many extensions or
+ * certificate data can span multiple segments. 4096 bytes captures
+ * these coalesced packets for proper nDPI reassembly and classification.
+ */
+#define MAX_PACKET_SAMPLE 4096
 #define PACKETS_TO_SAMPLE 50
 
 #define FLOW_FAMILY_IPV4 4

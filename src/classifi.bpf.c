@@ -221,45 +221,29 @@ static __always_inline __u8 canonicalize_flow_key(struct flow_key *key)
 
 static __always_inline void sample_packet(struct __sk_buff *skb,
                                           struct flow_key *key,
-                                          void *data,
-                                          void *data_end,
                                           __u8 direction,
                                           __u64 ts_ns,
                                           __u16 l3_offset)
 {
 	struct packet_sample *sample;
-	__u64 data_bytes;
 	__u32 len;
 
 	sample = bpf_ringbuf_reserve(&packet_samples, sizeof(*sample), 0);
 	if (!sample) {
-		__u32 key = 0;
-		__u64 *count = bpf_map_lookup_elem(&ringbuf_stats, &key);
+		__u32 stats_key = 0;
+		__u64 *count = bpf_map_lookup_elem(&ringbuf_stats, &stats_key);
 		if (count)
 			__sync_fetch_and_add(count, 1);
 		return;
 	}
 
-	if (data_end < data)
-		goto discard;
-
-	data_bytes = (__u64)data_end - (__u64)data;
-	if (data_bytes == 0)
-		goto submit_zero;
-
-	if (data_bytes > MAX_PACKET_SAMPLE)
+	len = skb->len;
+	if (len > MAX_PACKET_SAMPLE)
 		len = MAX_PACKET_SAMPLE;
-	else
-		len = (__u32)data_bytes;
 
-	/* Bounded loop structure required for BPF verifier */
-	unsigned char *pkt_data = (unsigned char *)data;
-	for (__u32 i = 0; i < MAX_PACKET_SAMPLE; i++) {
-		if (i >= len)
-			break;
-		if ((void *)(pkt_data + i + 1) > data_end)
-			break;
-		sample->data[i] = pkt_data[i];
+	if (len == 0 || bpf_skb_load_bytes(skb, 0, sample->data, len) < 0) {
+		bpf_ringbuf_discard(sample, 0);
+		return;
 	}
 
 	__builtin_memcpy(&sample->key, key, sizeof(*key));
@@ -271,15 +255,6 @@ static __always_inline void sample_packet(struct __sk_buff *skb,
 	sample->data_len = len;
 
 	bpf_ringbuf_submit(sample, 0);
-	return;
-
-submit_zero:
-	sample->data_len = 0;
-	bpf_ringbuf_submit(sample, 0);
-	return;
-
-discard:
-	bpf_ringbuf_discard(sample, 0);
 }
 
 SEC("tc")
@@ -288,11 +263,25 @@ int classifi(struct __sk_buff *skb)
 	struct flow_key key = {};
 	struct flow_info *info, new_info = {};
 	__u64 now = bpf_ktime_get_ns();
-	void *data = (void *)(long)skb->data;
-	void *data_end = (void *)(long)skb->data_end;
+	void *data;
+	void *data_end;
 	__u8 direction;
 	__u64 old_count;
 	__u16 l3_offset = 0;
+
+	/*
+	 * Linearize packet data for GRO'd packets. GRO coalesces multiple
+	 * TCP segments into one skb with data split across frags. Without
+	 * this, skb->data only contains the first segment's worth of data.
+	 * Pull min(skb->len, MAX_PACKET_SAMPLE) since pull_data fails if
+	 * we request more than available.
+	 */
+	__u32 pull_len = skb->len < MAX_PACKET_SAMPLE ? skb->len : MAX_PACKET_SAMPLE;
+	if (bpf_skb_pull_data(skb, pull_len) < 0)
+		return TC_ACT_OK;
+
+	data = (void *)(long)skb->data;
+	data_end = (void *)(long)skb->data_end;
 
 	if (parse_flow_key(skb, &key, &l3_offset) < 0)
 		return TC_ACT_OK;
@@ -314,14 +303,14 @@ int classifi(struct __sk_buff *skb)
 				__sync_fetch_and_add(count, 1);
 			return TC_ACT_OK;
 		}
-		sample_packet(skb, &key, data, data_end, direction, now, l3_offset);
+		sample_packet(skb, &key, direction, now, l3_offset);
 	} else {
 		old_count = __sync_fetch_and_add(&info->packets, 1);
 		__sync_fetch_and_add(&info->bytes, skb->len);
 		info->last_seen = now;
 
 		if (info->state == FLOW_STATE_NEW && old_count < PACKETS_TO_SAMPLE) {
-			sample_packet(skb, &key, data, data_end, direction, now, l3_offset);
+			sample_packet(skb, &key, direction, now, l3_offset);
 
 			if (old_count + 1 >= PACKETS_TO_SAMPLE)
 				info->state = FLOW_STATE_SAMPLED;
