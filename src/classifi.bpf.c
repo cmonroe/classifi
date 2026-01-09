@@ -263,8 +263,6 @@ int classifi(struct __sk_buff *skb)
 	struct flow_key key = {};
 	struct flow_info *info, new_info = {};
 	__u64 now = bpf_ktime_get_ns();
-	void *data;
-	void *data_end;
 	__u8 direction;
 	__u64 old_count;
 	__u16 l3_offset = 0;
@@ -279,9 +277,6 @@ int classifi(struct __sk_buff *skb)
 	__u32 pull_len = skb->len < MAX_PACKET_SAMPLE ? skb->len : MAX_PACKET_SAMPLE;
 	if (bpf_skb_pull_data(skb, pull_len) < 0)
 		return TC_ACT_OK;
-
-	data = (void *)(long)skb->data;
-	data_end = (void *)(long)skb->data_end;
 
 	if (parse_flow_key(skb, &key, &l3_offset) < 0)
 		return TC_ACT_OK;
