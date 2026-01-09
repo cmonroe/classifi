@@ -20,8 +20,8 @@ all: $(TARGETS)
 classifi.bpf.o: classifi.bpf.c classifi_bpf.h
 	$(CLANG) $(BPF_CFLAGS) $(BPF_INCLUDE) -c $< -o $@
 
-classifi: classifi.c classifi_ubus.c classifi_pcap.c classifi.h classifi_bpf.h classifi_ubus.h classifi_pcap.h
-	$(CC) $(CFLAGS) -o $@ classifi.c classifi_ubus.c classifi_pcap.c $(LDFLAGS)
+classifi: classifi.c classifi_ubus.c classifi_pcap.c classifi_dump.c classifi.h classifi_bpf.h classifi_ubus.h classifi_pcap.h classifi_dump.h
+	$(CC) $(CFLAGS) -o $@ classifi.c classifi_ubus.c classifi_pcap.c classifi_dump.c $(LDFLAGS)
 
 clean:
 	rm -f $(TARGETS)

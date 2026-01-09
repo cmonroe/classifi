@@ -43,6 +43,7 @@
 #include "classifi.h"
 #include "classifi_ubus.h"
 #include "classifi_pcap.h"
+#include "classifi_dump.h"
 
 #define TICK_RESOLUTION 1000
 
@@ -1116,6 +1117,10 @@ static int handle_sample(void *ctx, void *data, size_t len)
 	if (sample->l3_offset > sample->data_len)
 		return 0;
 
+	if (classifi_ctx->dump)
+		dump_write_packet(classifi_ctx->dump, sample->ifindex,
+				  sample->ts_ns, sample->data, sample->data_len);
+
 	classify_packet(classifi_ctx, sample);
 	return 0;
 }
@@ -1439,6 +1444,7 @@ int main(int argc, char **argv)
 	const char *iface_names[MAX_INTERFACES];
 	int num_iface_names = 0;
 	int discover_mode = 0;
+	const char *dump_filename = NULL;
 	int opt_idx = 1;
 
 	signal(SIGCHLD, SIG_IGN);
@@ -1473,18 +1479,30 @@ int main(int argc, char **argv)
 			num_iface_names = discover_interfaces_from_uci(iface_names, MAX_INTERFACES);
 			discover_mode = 1;
 			opt_idx++;
+		} else if (strcmp(argv[opt_idx], "-w") == 0 ||
+		           strcmp(argv[opt_idx], "--write") == 0) {
+			if (opt_idx + 1 >= argc) {
+				fprintf(stderr, "option %s requires a filename\n", argv[opt_idx]);
+				return 1;
+			}
+			dump_filename = argv[opt_idx + 1];
+			opt_idx += 2;
 		} else {
 			fprintf(stderr, "unknown option: %s\n", argv[opt_idx]);
-			fprintf(stderr, "usage: %s [-v] [-s] [-n] [-p] [-d] -i <interface> [...] <bpf_object.o>\n", argv[0]);
+			fprintf(stderr, "usage: %s [-v] [-s] [-p] [-d] [-w <file>] -i <interface> [...] <bpf_object.o>\n", argv[0]);
 			return 1;
 		}
 	}
 
 	if (ctx.pcap_mode) {
 		if (num_iface_names != 1) {
-			fprintf(stderr, "usage (pcap mode): %s [-v] [-s] [-n] -p -i <interface>\n", argv[0]);
+			fprintf(stderr, "usage (pcap mode): %s [-v] [-s] -p -i <interface>\n", argv[0]);
 			fprintf(stderr, "PCAP mode requires exactly one interface\n");
 			return 1;
+		}
+		if (dump_filename) {
+			fprintf(stderr, "warning: -w ignored in pcap mode\n");
+			dump_filename = NULL;
 		}
 		bpf_obj_path = NULL;
 	} else {
@@ -1493,7 +1511,7 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		if (argc - opt_idx < 1) {
-			fprintf(stderr, "usage (eBPF mode): %s [-v] [-s] [-n] [-d] -i <interface> [...] <bpf_object.o>\n", argv[0]);
+			fprintf(stderr, "usage (eBPF mode): %s [-v] [-s] [-d] [-w <file>] -i <interface> [...] <bpf_object.o>\n", argv[0]);
 			return 1;
 		}
 		bpf_obj_path = argv[opt_idx];
@@ -1570,6 +1588,17 @@ int main(int argc, char **argv)
 		get_interface_ip(&ctx.interfaces[ctx.num_interfaces - 1]);
 	}
 
+	if (dump_filename) {
+		ctx.dump = dump_open(dump_filename);
+		if (!ctx.dump) {
+			fprintf(stderr, "failed to open dump file, continuing without pcapng output\n");
+		} else {
+			for (int i = 0; i < ctx.num_interfaces; i++)
+				dump_add_interface(ctx.dump, ctx.interfaces[i].name,
+						   ctx.interfaces[i].ifindex);
+		}
+	}
+
 	ctx.ringbuf = ring_buffer__new(samples_fd, handle_sample, &ctx, NULL);
 	if (!ctx.ringbuf) {
 		fprintf(stderr, "failed to create ring buffer\n");
@@ -1614,6 +1643,10 @@ cleanup:
 	bpf_object__close(ctx.bpf_obj);
 	cleanup_flow_table(&ctx);
 	rules_free(&ctx);
+	if (ctx.dump) {
+		dump_close(ctx.dump);
+		ctx.dump = NULL;
+	}
 	if (ctx.ndpi)
 		ndpi_exit_detection_module(ctx.ndpi);
 

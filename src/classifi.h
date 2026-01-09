@@ -24,6 +24,8 @@
 
 #include "classifi_bpf.h"
 
+struct dump_writer;
+
 #define MAX_RULES 32
 #define MAX_PATTERN_LEN 256
 #define MAX_EXTRACTS 4
@@ -135,6 +137,8 @@ struct classifi_ctx {
 	int pcap_mode;
 
 	const char *pcap_ifname;
+
+	struct dump_writer *dump;
 
 	__u64 last_ringbuf_drops;
 };
