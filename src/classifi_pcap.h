@@ -17,5 +17,6 @@
 #include "classifi.h"
 
 int run_pcap_mode(struct classifi_ctx *ctx, const char *ifname);
+int run_pcap_replay(struct classifi_ctx *ctx, const char *filename);
 
 #endif /* CLASSIFI_PCAP_H */

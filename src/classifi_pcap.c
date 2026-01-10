@@ -32,6 +32,9 @@
 #ifndef ETH_P_8021AD
 #define ETH_P_8021AD 0x88A8
 #endif
+#ifndef DLT_EN10MB
+#define DLT_EN10MB 1
+#endif
 
 #define CLEANUP_INTERVAL 30
 
@@ -471,6 +474,95 @@ int run_pcap_mode(struct classifi_ctx *ctx, const char *ifname)
 			last_cleanup = now;
 		}
 	}
+
+	pcap_close(handle);
+	return 0;
+}
+
+static void print_flow_summary(struct classifi_ctx *ctx)
+{
+	int total = 0, classified = 0, unknown = 0;
+
+	fprintf(stderr, "\n--- Flow Summary ---\n");
+
+	for (int i = 0; i < FLOW_TABLE_SIZE; i++) {
+		struct ndpi_flow *f = ctx->flow_table[i];
+
+		while (f) {
+			total++;
+
+			char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
+			flow_key_to_strings(&f->first_packet_key, src, sizeof(src),
+					    dst, sizeof(dst));
+
+			const char *master = ndpi_get_proto_name(ctx->ndpi,
+				f->protocol.proto.master_protocol);
+			const char *app = ndpi_get_proto_name(ctx->ndpi,
+				f->protocol.proto.app_protocol);
+
+			if (f->protocol.proto.app_protocol != NDPI_PROTOCOL_UNKNOWN ||
+			    f->protocol.proto.master_protocol != NDPI_PROTOCOL_UNKNOWN)
+				classified++;
+			else
+				unknown++;
+
+			fprintf(stderr, "  %s:%u -> %s:%u  %s/%s  pkts=%d",
+				src, f->first_packet_key.src_port,
+				dst, f->first_packet_key.dst_port,
+				master, app, f->packets_processed);
+
+			if (f->protocol_guessed)
+				fprintf(stderr, " (guessed)");
+			fprintf(stderr, "\n");
+
+			if (f->flow->host_server_name[0])
+				fprintf(stderr, "    hostname: %s\n",
+					f->flow->host_server_name);
+
+			if (f->tcp_fingerprint[0])
+				fprintf(stderr, "    tcp_fp: %s (%s)\n",
+					f->tcp_fingerprint, f->os_hint);
+
+			f = f->next;
+		}
+	}
+
+	fprintf(stderr, "\nReplay complete: %d flows (%d classified, %d unknown)\n",
+		total, classified, unknown);
+}
+
+int run_pcap_replay(struct classifi_ctx *ctx, const char *filename)
+{
+	char errbuf[PCAP_ERRBUF_SIZE];
+	pcap_t *handle;
+	int ret;
+
+	fprintf(stderr, "replaying pcap file: %s\n", filename);
+
+	handle = pcap_open_offline(filename, errbuf);
+	if (!handle) {
+		fprintf(stderr, "failed to open %s: %s\n", filename, errbuf);
+		return -1;
+	}
+
+	int dlt = pcap_datalink(handle);
+	if (dlt != DLT_EN10MB) {
+		fprintf(stderr, "unsupported datalink type %d (expected Ethernet)\n", dlt);
+		pcap_close(handle);
+		return -1;
+	}
+
+	ctx->pcap_ifname = "replay";
+	ctx->flow_map_fd = -1;
+
+	while ((ret = pcap_dispatch(handle, 1000, pcap_packet_handler,
+				    (unsigned char *)ctx)) > 0)
+		;
+
+	if (ret < 0 && ret != PCAP_ERROR_BREAK)
+		fprintf(stderr, "pcap_dispatch error: %s\n", pcap_geterr(handle));
+
+	print_flow_summary(ctx);
 
 	pcap_close(handle);
 	return 0;

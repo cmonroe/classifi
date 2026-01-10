@@ -1445,6 +1445,7 @@ int main(int argc, char **argv)
 	int num_iface_names = 0;
 	int discover_mode = 0;
 	const char *dump_filename = NULL;
+	const char *replay_filename = NULL;
 	int opt_idx = 1;
 
 	signal(SIGCHLD, SIG_IGN);
@@ -1487,14 +1488,28 @@ int main(int argc, char **argv)
 			}
 			dump_filename = argv[opt_idx + 1];
 			opt_idx += 2;
+		} else if (strcmp(argv[opt_idx], "-r") == 0 ||
+		           strcmp(argv[opt_idx], "--read") == 0) {
+			if (opt_idx + 1 >= argc) {
+				fprintf(stderr, "option %s requires a filename\n", argv[opt_idx]);
+				return 1;
+			}
+			replay_filename = argv[opt_idx + 1];
+			opt_idx += 2;
 		} else {
 			fprintf(stderr, "unknown option: %s\n", argv[opt_idx]);
-			fprintf(stderr, "usage: %s [-v] [-s] [-p] [-d] [-w <file>] -i <interface> [...] <bpf_object.o>\n", argv[0]);
+			fprintf(stderr, "usage: %s [-v] [-s] [-p] [-r <file>] [-d] [-w <file>] -i <interface> [...] <bpf_object.o>\n", argv[0]);
 			return 1;
 		}
 	}
 
-	if (ctx.pcap_mode) {
+	if (replay_filename) {
+		if (ctx.pcap_mode) {
+			fprintf(stderr, "-r and -p are mutually exclusive\n");
+			return 1;
+		}
+		bpf_obj_path = NULL;
+	} else if (ctx.pcap_mode) {
 		if (num_iface_names != 1) {
 			fprintf(stderr, "usage (pcap mode): %s [-v] [-s] -p -i <interface>\n", argv[0]);
 			fprintf(stderr, "PCAP mode requires exactly one interface\n");
@@ -1538,6 +1553,11 @@ int main(int argc, char **argv)
 	}
 
 	rules_load_from_uci(&ctx);
+
+	if (replay_filename) {
+		err = run_pcap_replay(&ctx, replay_filename);
+		goto cleanup;
+	}
 
 	if (ctx.pcap_mode) {
 		ctx.pcap_ifname = iface_names[0];
