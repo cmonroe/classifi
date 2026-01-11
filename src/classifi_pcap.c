@@ -268,8 +268,18 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 			l3_len, flow->packets_dir0, flow->packets_dir1);
 	}
 
-	if (flow->detection_finalized)
-		return;
+	if (flow->detection_finalized) {
+		if (ctx->verbose)
+			fprintf(stderr, "  [SKIP CHECK] finalized=%d hsn=%d ch=%d pkts=%d\n",
+				flow->detection_finalized,
+				flow->flow->host_server_name[0] ? 1 : 0,
+				flow->flow->protos.tls_quic.client_hello_processed,
+				flow->packets_processed);
+		if (flow->flow->host_server_name[0] ||
+		    flow->flow->protos.tls_quic.client_hello_processed ||
+		    flow->packets_processed >= 50)
+			return;
+	}
 
 	if (!l3_data || l3_len == 0) {
 		if (ctx->verbose)
