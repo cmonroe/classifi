@@ -34,13 +34,10 @@ static const char *
 uci_get_option_string(struct uci_section *s, const char *option)
 {
 	struct uci_option *o;
-	struct uci_element *e;
 
-	uci_foreach_element(&s->options, e) {
-		o = uci_to_option(e);
-		if (strcmp(o->e.name, option) == 0 && o->type == UCI_TYPE_STRING)
-			return o->v.string;
-	}
+	o = uci_lookup_option(s->package->ctx, s, option);
+	if (o && o->type == UCI_TYPE_STRING)
+		return o->v.string;
 	return NULL;
 }
 
@@ -260,14 +257,9 @@ rules_load_from_uci(struct classifi_ctx *ctx)
 
 		if (ctx->verbose) {
 			char ip_str[INET6_ADDRSTRLEN] = "any";
-			if (rule->has_dst_ip) {
-				if (rule->dst_family == FLOW_FAMILY_IPV4) {
-					uint32_t ip = (uint32_t)rule->dst_ip.lo;
-					inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
-				} else {
-					inet_ntop(AF_INET6, &rule->dst_ip, ip_str, sizeof(ip_str));
-				}
-			}
+			if (rule->has_dst_ip)
+				flow_addr_to_string(&rule->dst_ip, rule->dst_family,
+						    ip_str, sizeof(ip_str));
 			fprintf(stderr, "loaded rule '%s': %s:%u%s%s pattern='%s'%s\n",
 				rule->name, ip_str, rule->dst_port,
 				rule->host_header[0] ? " host=" : "",
@@ -371,32 +363,24 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 	void *flow_obj, *stack_array;
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
 	const char *master_name, *app_name, *category_name;
-	struct flow_key display_key;
+	struct flow_key *display_key;
 	uint64_t now = monotonic_time_sec();
 
-	if (flow->have_first_packet_key)
-		display_key = flow->first_packet_key;
-	else
-		display_key = flow->key;
+	display_key = flow_display_key(flow);
 
-	flow_key_to_strings(&display_key, src_ip, sizeof(src_ip),
+	flow_key_to_strings(display_key, src_ip, sizeof(src_ip),
 			    dst_ip, sizeof(dst_ip));
-
-	if (flow->protocol.proto.master_protocol == NDPI_PROTOCOL_UNKNOWN)
-		master_name = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.app_protocol);
-	else
-		master_name = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.master_protocol);
-	app_name = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.app_protocol);
+	flow_get_protocol_names(ctx, flow, &master_name, &app_name);
 	category_name = ndpi_category_get_name(ctx->ndpi, flow->protocol.category);
 
 	flow_obj = blobmsg_open_table(b, NULL);
 
 	blobmsg_add_string(b, "src_ip", src_ip);
-	blobmsg_add_u32(b, "src_port", display_key.src_port);
+	blobmsg_add_u32(b, "src_port", display_key->src_port);
 	blobmsg_add_string(b, "dst_ip", dst_ip);
-	blobmsg_add_u32(b, "dst_port", display_key.dst_port);
-	blobmsg_add_u32(b, "protocol", display_key.protocol);
-	blobmsg_add_string(b, "family", display_key.family == FLOW_FAMILY_IPV4 ? "ipv4" : "ipv6");
+	blobmsg_add_u32(b, "dst_port", display_key->dst_port);
+	blobmsg_add_u32(b, "protocol", display_key->protocol);
+	blobmsg_add_string(b, "family", display_key->family == FLOW_FAMILY_IPV4 ? "ipv4" : "ipv6");
 
 	blobmsg_add_string(b, "master_protocol", master_name);
 	blobmsg_add_string(b, "app_protocol", app_name);
@@ -427,7 +411,7 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 		blobmsg_add_u32(b, "risk_score_server", flow->risk_score_server);
 
 		risks_array = blobmsg_open_array(b, "risks");
-		for (int i = 0; i < 64; i++) {
+		for (int i = 0; i < MAX_RISK_BITS; i++) {
 			if (flow->risk & (1ULL << i))
 				blobmsg_add_string(b, NULL, ndpi_risk2str((ndpi_risk_enum)i));
 		}
@@ -436,8 +420,8 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 
 	if (flow->protocol_stack_count > 1) {
 		int stack_count = flow->protocol_stack_count;
-		if (stack_count > 8)
-			stack_count = 8;
+		if (stack_count > MAX_PROTOCOL_STACK_SIZE)
+			stack_count = MAX_PROTOCOL_STACK_SIZE;
 		stack_array = blobmsg_open_array(b, "protocol_stack");
 		for (int j = 0; j < stack_count; j++)
 			blobmsg_add_string(b, NULL, ndpi_get_proto_name(ctx->ndpi, flow->protocol_stack[j]));
@@ -514,17 +498,12 @@ classifi_status_handler(struct ubus_context *uctx, struct ubus_object *obj,
 		blobmsg_add_u32(&b, "ifindex", info->ifindex);
 		blobmsg_add_u8(&b, "discovered", info->discovered);
 
-		if (info->local_ip_family == FLOW_FAMILY_IPV4) {
-			uint32_t ip = (uint32_t)info->local_ip.lo;
-			inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
+		if (info->local_ip_family) {
+			flow_addr_to_string(&info->local_ip, info->local_ip_family,
+					    ip_str, sizeof(ip_str));
 			blobmsg_add_string(&b, "local_ip", ip_str);
-			blobmsg_add_string(&b, "family", "ipv4");
-		} else if (info->local_ip_family == FLOW_FAMILY_IPV6) {
-			struct in6_addr addr;
-			memcpy(&addr, &info->local_ip, sizeof(addr));
-			inet_ntop(AF_INET6, &addr, ip_str, sizeof(ip_str));
-			blobmsg_add_string(&b, "local_ip", ip_str);
-			blobmsg_add_string(&b, "family", "ipv6");
+			blobmsg_add_string(&b, "family",
+					   info->local_ip_family == FLOW_FAMILY_IPV4 ? "ipv4" : "ipv6");
 		}
 
 		blobmsg_close_table(&b, iface_obj);
@@ -540,14 +519,8 @@ classifi_status_handler(struct ubus_context *uctx, struct ubus_object *obj,
 		blobmsg_add_u8(&b, "enabled", rule->enabled);
 
 		if (rule->has_dst_ip) {
-			if (rule->dst_family == FLOW_FAMILY_IPV4) {
-				uint32_t ip = (uint32_t)rule->dst_ip.lo;
-				inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
-			} else {
-				struct in6_addr addr;
-				memcpy(&addr, &rule->dst_ip, sizeof(addr));
-				inet_ntop(AF_INET6, &addr, ip_str, sizeof(ip_str));
-			}
+			flow_addr_to_string(&rule->dst_ip, rule->dst_family,
+					    ip_str, sizeof(ip_str));
 			blobmsg_add_string(&b, "dst_ip", ip_str);
 		}
 

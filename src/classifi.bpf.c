@@ -22,6 +22,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#define __BPF__
 #include "classifi_bpf.h"
 
 #ifndef ETH_P_8021AD
@@ -167,56 +168,6 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 	}
 
 	return -1;
-}
-
-static __always_inline void swap_flow_endpoints(struct flow_key *key)
-{
-	__u16 tmp_port = key->src_port;
-	__u64 tmp_hi = key->src.hi;
-	__u64 tmp_lo = key->src.lo;
-
-	key->src_port = key->dst_port;
-	key->dst_port = tmp_port;
-
-	key->src.hi = key->dst.hi;
-	key->src.lo = key->dst.lo;
-	key->dst.hi = tmp_hi;
-	key->dst.lo = tmp_lo;
-}
-
-static __always_inline __u8 canonicalize_flow_key(struct flow_key *key)
-{
-	__u8 swapped = 0;
-
-	if (key->family == FLOW_FAMILY_IPV4) {
-		__u32 src = (__u32)key->src.lo;
-		__u32 dst = (__u32)key->dst.lo;
-
-		if (src > dst)
-			swapped = 1;
-		else if (src == dst && key->src_port > key->dst_port)
-			swapped = 1;
-	} else if (key->family == FLOW_FAMILY_IPV6) {
-		if (key->src.hi > key->dst.hi)
-			swapped = 1;
-		else if (key->src.hi == key->dst.hi &&
-		         key->src.lo > key->dst.lo)
-			swapped = 1;
-		else if (key->src.hi == key->dst.hi &&
-		         key->src.lo == key->dst.lo &&
-		         key->src_port > key->dst_port)
-			swapped = 1;
-	} else {
-		if (key->src.hi > key->dst.hi)
-			swapped = 1;
-		else if (key->src.hi == key->dst.hi && key->src.lo > key->dst.lo)
-			swapped = 1;
-	}
-
-	if (swapped)
-		swap_flow_endpoints(key);
-
-	return swapped;
 }
 
 static __always_inline void sample_packet(struct __sk_buff *skb,

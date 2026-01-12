@@ -30,6 +30,13 @@ struct dump_writer;
 #define MAX_PATTERN_LEN 256
 #define MAX_EXTRACTS 4
 
+#define FLOW_IDLE_TIMEOUT 30
+#define FLOW_ABSOLUTE_TIMEOUT 60
+#define CLEANUP_INTERVAL 30
+
+#define MAX_PROTOCOL_STACK_SIZE 8
+#define MAX_RISK_BITS 64
+
 struct classifi_rule {
 	char name[64];
 	int enabled;
@@ -94,7 +101,7 @@ struct ndpi_flow {
 	char tcp_fingerprint[64];
 	char os_hint[32];
 	int protocol_stack_count;
-	u_int16_t protocol_stack[8];
+	u_int16_t protocol_stack[MAX_PROTOCOL_STACK_SIZE];
 	__u32 rules_matched;
 
 	ndpi_risk risk;
@@ -108,6 +115,11 @@ struct ndpi_flow {
 
 	struct ndpi_flow *next;
 };
+
+static inline struct flow_key *flow_display_key(struct ndpi_flow *flow)
+{
+	return flow->have_first_packet_key ? &flow->first_packet_key : &flow->key;
+}
 
 struct classifi_ctx {
 	struct ndpi_detection_module_struct *ndpi;
@@ -151,12 +163,15 @@ void flow_table_iterate(struct classifi_ctx *ctx,
 			flow_visitor_fn visitor,
 			void *user_data);
 
-void swap_flow_endpoints(struct flow_key *key);
 void flow_key_to_strings(const struct flow_key *key,
 			 char *src_ip, size_t src_len,
 			 char *dst_ip, size_t dst_len);
-struct ndpi_flow *flow_table_lookup(struct classifi_ctx *ctx, struct flow_key *key);
+void flow_addr_to_string(const struct flow_addr *addr, __u8 family,
+			 char *out, size_t out_len);
+struct ndpi_flow *flow_table_lookup(struct classifi_ctx *ctx, const struct flow_key *key);
 struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *key);
+struct ndpi_flow *flow_get_or_create(struct classifi_ctx *ctx, struct flow_key *key,
+				     const struct flow_key *packet_view, __u8 direction);
 int tls_quic_metadata_ready(struct ndpi_flow *flow);
 void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			       const char *ifname);
@@ -165,6 +180,25 @@ void emit_dns_event(struct classifi_ctx *ctx, const char *client_ip,
 int extract_dns_query_name(const unsigned char *dns_payload, unsigned int len,
 			   char *out, size_t out_len, uint16_t *qtype);
 void cleanup_expired_flows(struct classifi_ctx *ctx);
+
+void flow_update_metadata(struct ndpi_flow *flow, ndpi_protocol *protocol);
+void flow_get_protocol_names(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			     const char **master, const char **app);
+void flow_check_dns_query(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			  const struct flow_key *packet_view,
+			  const unsigned char *l3_data, unsigned int l3_len,
+			  const char *src_ip, const char *ifname,
+			  ndpi_protocol *protocol);
+int flow_check_detection_finalized(struct ndpi_flow *flow, ndpi_protocol *protocol);
+void flow_detection_giveup(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			   ndpi_protocol *protocol, int packets_threshold);
+int flow_handle_classification(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			       ndpi_protocol *protocol, const char *ifname);
+void flow_process_ndpi_result(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			      ndpi_protocol *protocol,
+			      const struct flow_key *packet_view,
+			      const unsigned char *l3_data, unsigned int l3_len,
+			      const char *src_ip, const char *ifname);
 
 struct interface_info *interface_by_name(struct classifi_ctx *ctx, const char *name);
 int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,

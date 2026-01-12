@@ -45,12 +45,6 @@
 #include "classifi_pcap.h"
 #include "classifi_dump.h"
 
-#define TICK_RESOLUTION 1000
-
-#define FLOW_IDLE_TIMEOUT 30
-#define FLOW_ABSOLUTE_TIMEOUT 60
-#define CLEANUP_INTERVAL 30
-
 volatile int keep_running = 1;
 
 static struct interface_info *interface_by_index(struct classifi_ctx *ctx, int ifindex)
@@ -95,6 +89,10 @@ static void cleanup_flow_table(struct classifi_ctx *ctx)
 #define FNV_OFFSET 2166136261u
 #define FNV_PRIME 16777619u
 
+#define DNS_HEADER_SIZE 12
+#define DNS_MAX_LABEL_LEN 63
+#define DNS_COMPRESSION_PTR 0xC0
+
 static inline unsigned int fnv_mix64(unsigned int hash, __u64 value)
 {
 	hash ^= (unsigned int)(value >> 32);
@@ -127,10 +125,10 @@ static const char *dns_qtype_str(uint16_t qtype, char *buf, size_t buflen)
 int extract_dns_query_name(const unsigned char *dns_payload, unsigned int len,
 			   char *out, size_t out_len, uint16_t *qtype)
 {
-	unsigned int pos = 12;
+	unsigned int pos = DNS_HEADER_SIZE;
 	unsigned int out_pos = 0;
 
-	if (len < 12)
+	if (len < DNS_HEADER_SIZE)
 		return -1;
 
 	while (pos < len && out_pos < out_len - 1) {
@@ -149,11 +147,10 @@ int extract_dns_query_name(const unsigned char *dns_payload, unsigned int len,
 			return 0;
 		}
 
-		/* Compression pointer - not expected in queries */
-		if (label_len >= 0xC0)
+		if (label_len >= DNS_COMPRESSION_PTR)
 			break;
 
-		if (label_len > 63 || pos + 1 + label_len > len)
+		if (label_len > DNS_MAX_LABEL_LEN || pos + 1 + label_len > len)
 			break;
 
 		pos++;
@@ -168,7 +165,7 @@ int extract_dns_query_name(const unsigned char *dns_payload, unsigned int len,
 	return -1;
 }
 
-static unsigned int flow_hash(struct flow_key *key)
+static unsigned int flow_hash(const struct flow_key *key)
 {
 	unsigned int hash = FNV_OFFSET;
 	hash ^= key->family;
@@ -184,12 +181,12 @@ static unsigned int flow_hash(struct flow_key *key)
 	return hash % FLOW_TABLE_SIZE;
 }
 
-static int flow_key_equal(struct flow_key *a, struct flow_key *b)
+static int flow_key_equal(const struct flow_key *a, const struct flow_key *b)
 {
 	return memcmp(a, b, sizeof(*a)) == 0;
 }
 
-struct ndpi_flow *flow_table_lookup(struct classifi_ctx *ctx, struct flow_key *key)
+struct ndpi_flow *flow_table_lookup(struct classifi_ctx *ctx, const struct flow_key *key)
 {
 	unsigned int hash = flow_hash(key);
 	struct ndpi_flow *flow = ctx->flow_table[hash];
@@ -202,39 +199,26 @@ struct ndpi_flow *flow_table_lookup(struct classifi_ctx *ctx, struct flow_key *k
 	return NULL;
 }
 
-void swap_flow_endpoints(struct flow_key *key)
-{
-	__u16 tmp_port = key->src_port;
-	__u64 tmp_hi = key->src.hi;
-	__u64 tmp_lo = key->src.lo;
-	key->src_port = key->dst_port;
-	key->dst_port = tmp_port;
-	key->src.hi = key->dst.hi;
-	key->src.lo = key->dst.lo;
-	key->dst.hi = tmp_hi;
-	key->dst.lo = tmp_lo;
-}
-
 void flow_key_to_strings(const struct flow_key *key,
 			 char *src_ip, size_t src_len,
 			 char *dst_ip, size_t dst_len)
 {
-	if (key->family == FLOW_FAMILY_IPV4) {
-		struct in_addr src = { .s_addr = (__u32)key->src.lo };
-		struct in_addr dst = { .s_addr = (__u32)key->dst.lo };
+	flow_addr_to_string(&key->src, key->family, src_ip, src_len);
+	flow_addr_to_string(&key->dst, key->family, dst_ip, dst_len);
+}
 
-		inet_ntop(AF_INET, &src, src_ip, src_len);
-		inet_ntop(AF_INET, &dst, dst_ip, dst_len);
-	} else if (key->family == FLOW_FAMILY_IPV6) {
-		struct in6_addr src6, dst6;
-
-		memcpy(&src6, &key->src, sizeof(src6));
-		memcpy(&dst6, &key->dst, sizeof(dst6));
-		inet_ntop(AF_INET6, &src6, src_ip, src_len);
-		inet_ntop(AF_INET6, &dst6, dst_ip, dst_len);
+void flow_addr_to_string(const struct flow_addr *addr, __u8 family,
+			 char *out, size_t out_len)
+{
+	if (family == FLOW_FAMILY_IPV4) {
+		uint32_t ip = (uint32_t)addr->lo;
+		inet_ntop(AF_INET, &ip, out, out_len);
+	} else if (family == FLOW_FAMILY_IPV6) {
+		struct in6_addr addr6;
+		memcpy(&addr6, addr, sizeof(addr6));
+		inet_ntop(AF_INET6, &addr6, out, out_len);
 	} else {
-		snprintf(src_ip, src_len, "unknown");
-		snprintf(dst_ip, dst_len, "unknown");
+		snprintf(out, out_len, "unknown");
 	}
 }
 
@@ -265,6 +249,47 @@ struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *k
 	return flow;
 }
 
+struct ndpi_flow *flow_get_or_create(struct classifi_ctx *ctx, struct flow_key *key,
+				     const struct flow_key *packet_view, __u8 direction)
+{
+	struct ndpi_flow *flow;
+	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
+
+	flow = flow_table_lookup(ctx, key);
+	if (!flow) {
+		flow = flow_table_insert(ctx, key);
+		if (!flow) {
+			flow_key_to_strings(packet_view, src_ip, sizeof(src_ip),
+					    dst_ip, sizeof(dst_ip));
+			fprintf(stderr, "failed to create flow for %s:%u -> %s:%u\n",
+				src_ip, packet_view->src_port,
+				dst_ip, packet_view->dst_port);
+			return NULL;
+		}
+		if (ctx->verbose) {
+			flow_key_to_strings(packet_view, src_ip, sizeof(src_ip),
+					    dst_ip, sizeof(dst_ip));
+			fprintf(stderr, "new flow: %s:%u -> %s:%u proto=%u\n",
+				src_ip, packet_view->src_port,
+				dst_ip, packet_view->dst_port, packet_view->protocol);
+		}
+	}
+
+	if (!flow->have_first_packet_key) {
+		flow->first_packet_key = *packet_view;
+		flow->have_first_packet_key = 1;
+	}
+
+	flow->packets_processed++;
+	flow->last_seen = monotonic_time_sec();
+	if (direction == 0)
+		flow->packets_dir0++;
+	else
+		flow->packets_dir1++;
+
+	return flow;
+}
+
 static void signal_handler(int sig)
 {
 	keep_running = 0;
@@ -291,51 +316,51 @@ int get_interface_ip(struct interface_info *iface)
 		if (ifa->ifa_addr == NULL)
 			continue;
 
-		if (strcmp(ifa->ifa_name, iface->name) == 0) {
-			if (ifa->ifa_addr->sa_family == AF_INET) {
-				struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
-				struct sockaddr_in *netmask = (struct sockaddr_in *)ifa->ifa_netmask;
+		if (strcmp(ifa->ifa_name, iface->name) != 0)
+			continue;
 
-				iface->local_ip_family = FLOW_FAMILY_IPV4;
-				iface->local_ip.hi = 0;
-				iface->local_ip.lo = (__u64)addr->sin_addr.s_addr;
+		if (ifa->ifa_addr->sa_family == AF_INET) {
+			struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
+			struct sockaddr_in *netmask = (struct sockaddr_in *)ifa->ifa_netmask;
+			char ip_str[INET_ADDRSTRLEN];
 
-				if (netmask)
-					iface->local_subnet_mask = netmask->sin_addr.s_addr;
+			iface->local_ip_family = FLOW_FAMILY_IPV4;
+			iface->local_ip.hi = 0;
+			iface->local_ip.lo = (__u64)addr->sin_addr.s_addr;
 
-				found = 1;
+			if (netmask)
+				iface->local_subnet_mask = netmask->sin_addr.s_addr;
 
-				char ip_str[INET_ADDRSTRLEN];
+			found = 1;
+			inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
+
+			if (netmask) {
 				char mask_str[INET_ADDRSTRLEN];
-				inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
-
-				if (netmask) {
-					inet_ntop(AF_INET, &netmask->sin_addr, mask_str, sizeof(mask_str));
-					printf("interface %s IPv4: %s/%s\n",
-						iface->name, ip_str, mask_str);
-				} else {
-					printf("interface %s IPv4: %s\n",
-						iface->name, ip_str);
-				}
-				break;
-			} else if (ifa->ifa_addr->sa_family == AF_INET6 && !found) {
-				struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)ifa->ifa_addr;
-				iface->local_ip_family = FLOW_FAMILY_IPV6;
-				memcpy(&iface->local_ip, &addr6->sin6_addr, sizeof(struct in6_addr));
-				found = 1;
-
-				char ip_str[INET6_ADDRSTRLEN];
-				inet_ntop(AF_INET6, &addr6->sin6_addr, ip_str, sizeof(ip_str));
-				printf("interface %s IPv6: %s\n", iface->name, ip_str);
+				inet_ntop(AF_INET, &netmask->sin_addr, mask_str, sizeof(mask_str));
+				printf("interface %s IPv4: %s/%s\n", iface->name, ip_str, mask_str);
+			} else {
+				printf("interface %s IPv4: %s\n", iface->name, ip_str);
 			}
+			break;
+		}
+
+		if (ifa->ifa_addr->sa_family == AF_INET6 && !found) {
+			struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+			char ip_str[INET6_ADDRSTRLEN];
+
+			iface->local_ip_family = FLOW_FAMILY_IPV6;
+			memcpy(&iface->local_ip, &addr6->sin6_addr, sizeof(struct in6_addr));
+			found = 1;
+
+			inet_ntop(AF_INET6, &addr6->sin6_addr, ip_str, sizeof(ip_str));
+			printf("interface %s IPv6: %s\n", iface->name, ip_str);
 		}
 	}
 
 	freeifaddrs(ifaddr);
 
-	if (!found) {
-		fprintf(stderr, "warning: Could not determine IP address for %s\n", iface->name);
-	}
+	if (!found)
+		fprintf(stderr, "warning: could not determine IP address for %s\n", iface->name);
 
 	return found ? 0 : -1;
 }
@@ -368,18 +393,10 @@ void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 	if (!ctx->ubus_ctx)
 		return;
 
-	if (flow->have_first_packet_key)
-		summary_key = flow->first_packet_key;
-	else
-		summary_key = flow->key;
+	summary_key = *flow_display_key(flow);
 
 	flow_key_to_strings(&summary_key, src_ip, sizeof(src_ip), dst_ip, sizeof(dst_ip));
-
-	if (flow->protocol.proto.master_protocol == NDPI_PROTOCOL_UNKNOWN)
-		master_name = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.app_protocol);
-	else
-		master_name = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.master_protocol);
-	app_name = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.app_protocol);
+	flow_get_protocol_names(ctx, flow, &master_name, &app_name);
 	category_name = ndpi_category_get_name(ctx->ndpi, flow->protocol.category);
 
 	blob_buf_init(&b, 0);
@@ -413,7 +430,7 @@ void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 		blobmsg_add_u32(&b, "risk_score_server", flow->risk_score_server);
 
 		void *risks = blobmsg_open_array(&b, "risks");
-		for (int i = 0; i < 64; i++) {
+		for (int i = 0; i < MAX_RISK_BITS; i++) {
 			if (flow->risk & (1ULL << i))
 				blobmsg_add_string(&b, NULL, ndpi_risk2str((ndpi_risk_enum)i));
 		}
@@ -453,7 +470,7 @@ void emit_dns_event(struct classifi_ctx *ctx, const char *client_ip, const char 
 
 	if (ubus_send_event(ctx->ubus_ctx, "classifi.dns_query", b.head) != 0) {
 		if (ctx->verbose)
-			fprintf(stderr, "Failed to send DNS event for %s -> %s\n", client_ip, domain);
+			fprintf(stderr, "failed to send DNS event for %s -> %s\n", client_ip, domain);
 	}
 
 	blob_buf_free(&b);
@@ -739,6 +756,264 @@ static void check_rules_and_execute(struct classifi_ctx *ctx,
 	}
 }
 
+static const unsigned char *dns_payload_extract(const unsigned char *l3_data,
+						 unsigned int l3_len,
+						 __u8 family,
+						 unsigned int *out_len)
+{
+	unsigned int offset;
+
+	if (family == FLOW_FAMILY_IPV4) {
+		struct iphdr *iph = (struct iphdr *)l3_data;
+		unsigned int ip_hdr_len = iph->ihl * 4;
+		offset = ip_hdr_len + 8;
+	} else {
+		offset = 40 + 8;
+	}
+
+	if (offset >= l3_len)
+		return NULL;
+
+	*out_len = l3_len - offset;
+	return l3_data + offset;
+}
+
+void flow_update_metadata(struct ndpi_flow *flow, ndpi_protocol *protocol)
+{
+	int stack_count;
+
+	if (flow->flow->tcp.fingerprint && flow->flow->tcp.fingerprint[0] &&
+	    !flow->tcp_fingerprint[0]) {
+		snprintf(flow->tcp_fingerprint, sizeof(flow->tcp_fingerprint), "%s",
+			 flow->flow->tcp.fingerprint);
+		snprintf(flow->os_hint, sizeof(flow->os_hint), "%s",
+			 ndpi_print_os_hint(flow->flow->tcp.os_hint));
+	}
+
+	if (protocol->protocol_stack.protos_num > 0 && flow->protocol_stack_count == 0) {
+		stack_count = protocol->protocol_stack.protos_num;
+		if (stack_count > MAX_PROTOCOL_STACK_SIZE)
+			stack_count = MAX_PROTOCOL_STACK_SIZE;
+
+		flow->protocol_stack_count = stack_count;
+		for (int i = 0; i < stack_count; i++)
+			flow->protocol_stack[i] = protocol->protocol_stack.protos[i];
+	}
+
+	flow->risk = flow->flow->risk;
+	if (flow->risk)
+		flow->risk_score = ndpi_risk2score(flow->risk,
+			&flow->risk_score_client, &flow->risk_score_server);
+
+	flow->multimedia_types = flow->flow->flow_multimedia_types;
+}
+
+void flow_get_protocol_names(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			     const char **master, const char **app)
+{
+	if (flow->protocol.proto.master_protocol == NDPI_PROTOCOL_UNKNOWN)
+		*master = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.app_protocol);
+	else
+		*master = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.master_protocol);
+	*app = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.app_protocol);
+}
+
+void flow_check_dns_query(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			  const struct flow_key *packet_view,
+			  const unsigned char *l3_data, unsigned int l3_len,
+			  const char *src_ip, const char *ifname,
+			  ndpi_protocol *protocol)
+{
+	const unsigned char *dns_payload;
+	unsigned int dns_len;
+	char query_name[256];
+	uint16_t qtype = 0;
+
+	if (protocol->proto.app_protocol != NDPI_PROTOCOL_DNS &&
+	    packet_view->dst_port != 53)
+		return;
+
+	if (packet_view->protocol != IPPROTO_UDP)
+		return;
+
+	if (flow->packets_processed > 2)
+		return;
+
+	dns_payload = dns_payload_extract(l3_data, l3_len, packet_view->family, &dns_len);
+	if (!dns_payload || dns_len == 0)
+		return;
+
+	if (extract_dns_query_name(dns_payload, dns_len, query_name, sizeof(query_name), &qtype) != 0)
+		return;
+
+	emit_dns_event(ctx, src_ip, query_name, qtype, ifname);
+	if (ctx->verbose)
+		fprintf(stderr, "  [DNS] Query: %s from %s\n", query_name, src_ip);
+}
+
+int flow_check_detection_finalized(struct ndpi_flow *flow, ndpi_protocol *protocol)
+{
+	if (flow->detection_finalized)
+		return 1;
+
+	if ((protocol->state == NDPI_STATE_CLASSIFIED ||
+	     protocol->state == NDPI_STATE_MONITORING) &&
+	    flow->flow->extra_packets_func == NULL) {
+		flow->detection_finalized = 1;
+		return 1;
+	}
+
+	return 0;
+}
+
+void flow_detection_giveup(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			   ndpi_protocol *protocol, int packets_threshold)
+{
+	if (flow->detection_finalized)
+		return;
+
+	if (flow->packets_processed < packets_threshold)
+		return;
+
+	if (ctx->verbose)
+		fprintf(stderr, "  [PKT %d] Calling ndpi_detection_giveup() [dir0=%d dir1=%d]...\n",
+			flow->packets_processed, flow->packets_dir0, flow->packets_dir1);
+
+	*protocol = ndpi_detection_giveup(ctx->ndpi, flow->flow);
+	flow->detection_finalized = 1;
+	flow->protocol_guessed = (protocol->proto.app_protocol != NDPI_PROTOCOL_UNKNOWN);
+
+	if (ctx->verbose) {
+		fprintf(stderr, "  [PKT %d] After giveup (guessed=%d, dir0=%d dir1=%d): master=%u (%s) app=%u (%s)\n",
+			flow->packets_processed,
+			flow->protocol_guessed, flow->packets_dir0, flow->packets_dir1,
+			protocol->proto.master_protocol,
+			ndpi_get_proto_name(ctx->ndpi, protocol->proto.master_protocol),
+			protocol->proto.app_protocol,
+			ndpi_get_proto_name(ctx->ndpi, protocol->proto.app_protocol));
+	}
+}
+
+static void flow_log_verbose_ndpi(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+				  ndpi_protocol *protocol,
+				  const char *src_ip, const char *dst_ip)
+{
+	fprintf(stderr, "  [PKT %d] nDPI process_packet: master=%u (%s) app=%u (%s) category=%s state=%d\n",
+		flow->packets_processed,
+		protocol->proto.master_protocol,
+		ndpi_get_proto_name(ctx->ndpi, protocol->proto.master_protocol),
+		protocol->proto.app_protocol,
+		ndpi_get_proto_name(ctx->ndpi, protocol->proto.app_protocol),
+		ndpi_category_get_name(ctx->ndpi, protocol->category),
+		protocol->state);
+
+	if (flow->tcp_fingerprint[0])
+		fprintf(stderr, "  [TCP FP] %s (OS: %s)\n",
+			flow->tcp_fingerprint, flow->os_hint);
+
+	if (flow->protocol_stack_count > 1) {
+		fprintf(stderr, "  [Stack] ");
+		for (int i = 0; i < flow->protocol_stack_count; i++) {
+			fprintf(stderr, "%s%s", i > 0 ? " -> " : "",
+				ndpi_get_proto_name(ctx->ndpi, flow->protocol_stack[i]));
+		}
+		fprintf(stderr, "\n");
+	}
+
+	if (flow->multimedia_types) {
+		char stream_content[64];
+		if (ndpi_multimedia_flowtype2str(stream_content, sizeof(stream_content),
+						 flow->multimedia_types))
+			fprintf(stderr, "  [Stream] %s\n", stream_content);
+	}
+
+	if (protocol->proto.app_protocol == NDPI_PROTOCOL_TLS && flow->packets_processed <= 10) {
+		fprintf(stderr, "  [TLS] %s -> %s dir0=%d dir1=%d ch=%d sh=%d sni=%s\n",
+			src_ip, dst_ip,
+			flow->packets_dir0, flow->packets_dir1,
+			flow->flow->protos.tls_quic.client_hello_processed,
+			flow->flow->protos.tls_quic.server_hello_processed,
+			flow->flow->host_server_name[0] ? flow->flow->host_server_name : "NONE");
+	}
+}
+
+void flow_process_ndpi_result(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			      ndpi_protocol *protocol,
+			      const struct flow_key *packet_view,
+			      const unsigned char *l3_data, unsigned int l3_len,
+			      const char *src_ip, const char *ifname)
+{
+	flow_update_metadata(flow, protocol);
+
+	if (ctx->verbose && (flow->packets_processed <= PACKETS_TO_SAMPLE ||
+			     flow->packets_processed % 20 == 0)) {
+		char dst_ip[INET6_ADDRSTRLEN];
+		flow_addr_to_string(&packet_view->dst, packet_view->family,
+				    dst_ip, sizeof(dst_ip));
+		flow_log_verbose_ndpi(ctx, flow, protocol, src_ip, dst_ip);
+	}
+
+	flow_check_dns_query(ctx, flow, packet_view, l3_data, l3_len, src_ip, ifname, protocol);
+
+	if (flow_check_detection_finalized(flow, protocol) && ctx->verbose)
+		fprintf(stderr, "  [PKT %d] Flow finalized via nDPI state=%d\n",
+			flow->packets_processed, protocol->state);
+
+	flow_detection_giveup(ctx, flow, protocol, PACKETS_TO_SAMPLE);
+	flow_handle_classification(ctx, flow, protocol, ifname);
+}
+
+int flow_handle_classification(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			       ndpi_protocol *protocol, const char *ifname)
+{
+	int newly_classified = 0;
+
+	if (protocol->proto.master_protocol == NDPI_PROTOCOL_UNKNOWN &&
+	    protocol->proto.app_protocol == NDPI_PROTOCOL_UNKNOWN)
+		return 0;
+
+	if (flow->protocol.proto.master_protocol != protocol->proto.master_protocol ||
+	    flow->protocol.proto.app_protocol != protocol->proto.app_protocol) {
+		if (flow->protocol.proto.master_protocol == NDPI_PROTOCOL_UNKNOWN &&
+		    flow->protocol.proto.app_protocol == NDPI_PROTOCOL_UNKNOWN)
+			newly_classified = 1;
+
+		if (ctx->verbose) {
+			fprintf(stderr, "  [PKT %d] Classification changed: old master=%u app=%u -> new master=%u app=%u\n",
+				flow->packets_processed,
+				flow->protocol.proto.master_protocol,
+				flow->protocol.proto.app_protocol,
+				protocol->proto.master_protocol,
+				protocol->proto.app_protocol);
+		}
+	}
+
+	flow->protocol = *protocol;
+
+	if (!ifname)
+		return newly_classified;
+
+	if (newly_classified) {
+		if (tls_quic_metadata_ready(flow)) {
+			emit_classification_event(ctx, flow, ifname);
+		} else {
+			flow->classification_event_pending = 1;
+			if (ctx->verbose)
+				fprintf(stderr, "  [PKT %d] Deferring event for TLS/QUIC metadata\n",
+					flow->packets_processed);
+		}
+	} else if (flow->classification_event_pending && tls_quic_metadata_ready(flow)) {
+		emit_classification_event(ctx, flow, ifname);
+		flow->classification_event_pending = 0;
+		if (ctx->verbose)
+			fprintf(stderr, "  [PKT %d] Emitting deferred TLS/QUIC event (SNI=%s)\n",
+				flow->packets_processed,
+				flow->flow->host_server_name[0] ? flow->flow->host_server_name : "none");
+	}
+
+	return newly_classified;
+}
+
 static struct ndpi_detection_module_struct *setup_ndpi(void)
 {
 	struct ndpi_detection_module_struct *ndpi_struct;
@@ -783,6 +1058,80 @@ static struct ndpi_detection_module_struct *setup_ndpi(void)
 	return ndpi_struct;
 }
 
+static void log_ip_header_debug(unsigned char *ip_packet, unsigned int ip_packet_len,
+				__u8 direction, const char *src_ip, const char *dst_ip,
+				unsigned int l3_offset)
+{
+	uint8_t ip_version = (ip_packet[0] >> 4) & 0x0f;
+
+	if (ip_version == 4 && ip_packet_len >= 20) {
+		struct iphdr *iph = (struct iphdr *)ip_packet;
+		char pkt_src[INET_ADDRSTRLEN], pkt_dst[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, &iph->saddr, pkt_src, sizeof(pkt_src));
+		inet_ntop(AF_INET, &iph->daddr, pkt_dst, sizeof(pkt_dst));
+		fprintf(stderr, "  [IP HDR] ver=%u src=%s dst=%s proto=%u bpf_dir=%u (flow_view: %s -> %s)\n",
+			ip_version, pkt_src, pkt_dst, iph->protocol, direction, src_ip, dst_ip);
+		return;
+	}
+
+	if (ip_version == 6 && ip_packet_len >= 40) {
+		struct ipv6hdr *ip6h = (struct ipv6hdr *)ip_packet;
+		char pkt_src[INET6_ADDRSTRLEN], pkt_dst[INET6_ADDRSTRLEN];
+		inet_ntop(AF_INET6, &ip6h->saddr, pkt_src, sizeof(pkt_src));
+		inet_ntop(AF_INET6, &ip6h->daddr, pkt_dst, sizeof(pkt_dst));
+		fprintf(stderr, "  [IP HDR] ver=%u src=%s dst=%s proto=%u bpf_dir=%u (flow_view: %s -> %s)\n",
+			ip_version, pkt_src, pkt_dst, ip6h->nexthdr, direction, src_ip, dst_ip);
+		return;
+	}
+
+	fprintf(stderr, "  [IP HDR] warning: invalid IP version %u at l3_offset %u\n",
+		ip_version, l3_offset);
+}
+
+static void log_ndpi_direction_debug(struct ndpi_flow *flow, const struct flow_key *packet_view,
+				     unsigned char *ip_packet, unsigned int ip_packet_len,
+				     const char *src_ip, const char *dst_ip)
+{
+	unsigned int ip_hdr_len, tcp_hdr_len, payload_off, payload_len;
+	const uint8_t *payload;
+	struct tcphdr *tcph;
+	struct iphdr *iph;
+
+	fprintf(stderr, "  [nDPI DIR] %s -> %s pkt_dir_counter[0]=%u [1]=%u client_dir=%u input_dir=%u pkt_dir=%u\n",
+		src_ip, dst_ip,
+		flow->flow->packet_direction_complete_counter[0],
+		flow->flow->packet_direction_complete_counter[1],
+		flow->flow->client_packet_direction,
+		flow->input_info.in_pkt_dir,
+		flow->flow->packet_direction);
+
+	if ((packet_view->dst_port != 443 && packet_view->src_port != 443) ||
+	    packet_view->protocol != IPPROTO_TCP)
+		return;
+
+	iph = (struct iphdr *)ip_packet;
+	ip_hdr_len = iph->ihl * 4;
+	tcph = (struct tcphdr *)(ip_packet + ip_hdr_len);
+	tcp_hdr_len = tcph->doff * 4;
+	payload_off = ip_hdr_len + tcp_hdr_len;
+
+	if (payload_off >= ip_packet_len)
+		return;
+
+	payload = ip_packet + payload_off;
+	payload_len = ip_packet_len - payload_off;
+
+	if (payload_len >= 5) {
+		fprintf(stderr, "  [TLS RAW] %s -> %s payload_len=%u first_bytes=%02x %02x %02x %02x %02x tcp_seq=%u\n",
+			src_ip, dst_ip,
+			payload_len, payload[0], payload[1], payload[2], payload[3], payload[4],
+			ntohl(tcph->seq));
+	} else if (payload_len > 0) {
+		fprintf(stderr, "  [TLS RAW] %s -> %s payload_len=%u (too short for TLS header)\n",
+			src_ip, dst_ip, payload_len);
+	}
+}
+
 static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *sample)
 {
 	struct ndpi_flow *flow;
@@ -797,35 +1146,11 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	if (sample->direction)
 		swap_flow_endpoints(&packet_view);
 
+	flow = flow_get_or_create(ctx, &sample->key, &packet_view, sample->direction);
+	if (!flow)
+		return;
+
 	flow_key_to_strings(&packet_view, src_ip, sizeof(src_ip), dst_ip, sizeof(dst_ip));
-
-	flow = flow_table_lookup(ctx, &sample->key);
-	if (!flow) {
-		flow = flow_table_insert(ctx, &sample->key);
-		if (!flow) {
-			fprintf(stderr, "failed to create flow for %s:%u -> %s:%u\n",
-				src_ip, packet_view.src_port,
-				dst_ip, packet_view.dst_port);
-			return;
-		}
-		if (ctx->verbose) {
-			fprintf(stderr, "new flow: %s:%u -> %s:%u proto=%u\n",
-				src_ip, packet_view.src_port,
-				dst_ip, packet_view.dst_port, packet_view.protocol);
-		}
-	}
-
-	if (!flow->have_first_packet_key) {
-		flow->first_packet_key = packet_view;
-		flow->have_first_packet_key = 1;
-	}
-
-	flow->packets_processed++;
-	flow->last_seen = monotonic_time_sec();
-	if (sample->direction == 0)
-		flow->packets_dir0++;
-	else
-		flow->packets_dir1++;
 
 	check_rules_and_execute(ctx, flow, &packet_view, sample,
 				interface_name_by_index(ctx, sample->ifindex));
@@ -864,27 +1189,9 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		return;
 	}
 
-	if (ctx->verbose && flow->packets_processed <= 5) {
-		uint8_t ip_version = (ip_packet[0] >> 4) & 0x0f;
-		if (ip_version == 4 && ip_packet_len >= 20) {
-			struct iphdr *iph = (struct iphdr *)ip_packet;
-			char pkt_src[INET_ADDRSTRLEN], pkt_dst[INET_ADDRSTRLEN];
-			inet_ntop(AF_INET, &iph->saddr, pkt_src, sizeof(pkt_src));
-			inet_ntop(AF_INET, &iph->daddr, pkt_dst, sizeof(pkt_dst));
-			fprintf(stderr, "  [IP HDR] ver=%u src=%s dst=%s proto=%u bpf_dir=%u (flow_view: %s -> %s)\n",
-				ip_version, pkt_src, pkt_dst, iph->protocol, sample->direction, src_ip, dst_ip);
-		} else if (ip_version == 6 && ip_packet_len >= 40) {
-			struct ipv6hdr *ip6h = (struct ipv6hdr *)ip_packet;
-			char pkt_src[INET6_ADDRSTRLEN], pkt_dst[INET6_ADDRSTRLEN];
-			inet_ntop(AF_INET6, &ip6h->saddr, pkt_src, sizeof(pkt_src));
-			inet_ntop(AF_INET6, &ip6h->daddr, pkt_dst, sizeof(pkt_dst));
-			fprintf(stderr, "  [IP HDR] ver=%u src=%s dst=%s proto=%u bpf_dir=%u (flow_view: %s -> %s)\n",
-				ip_version, pkt_src, pkt_dst, ip6h->nexthdr, sample->direction, src_ip, dst_ip);
-		} else {
-			fprintf(stderr, "  [IP HDR] WARNING: invalid IP version %u at l3_offset %u\n",
-				ip_version, l3_offset);
-		}
-	}
+	if (ctx->verbose && flow->packets_processed <= 5)
+		log_ip_header_debug(ip_packet, ip_packet_len, sample->direction,
+				    src_ip, dst_ip, l3_offset);
 
 	u_int64_t time_ms = sample->ts_ns ? sample->ts_ns / 1000000ULL : monotonic_time_sec() * 1000ULL;
 
@@ -894,213 +1201,12 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		ctx->ndpi, flow->flow, ip_packet, ip_packet_len,
 		time_ms, &flow->input_info);
 
-	if (ctx->verbose && flow->packets_processed <= 10) {
-		fprintf(stderr, "  [nDPI DIR] %s -> %s pkt_dir_counter[0]=%u [1]=%u client_dir=%u input_dir=%u pkt_dir=%u\n",
-			src_ip, dst_ip,
-			flow->flow->packet_direction_complete_counter[0],
-			flow->flow->packet_direction_complete_counter[1],
-			flow->flow->client_packet_direction,
-			flow->input_info.in_pkt_dir,
-			flow->flow->packet_direction);
+	if (ctx->verbose && flow->packets_processed <= 10)
+		log_ndpi_direction_debug(flow, &packet_view, ip_packet, ip_packet_len,
+					 src_ip, dst_ip);
 
-		if ((packet_view.dst_port == 443 || packet_view.src_port == 443) &&
-		    packet_view.protocol == IPPROTO_TCP) {
-			struct iphdr *iph = (struct iphdr *)ip_packet;
-			unsigned int ip_hdr_len = iph->ihl * 4;
-			struct tcphdr *tcph = (struct tcphdr *)(ip_packet + ip_hdr_len);
-			unsigned int tcp_hdr_len = tcph->doff * 4;
-			unsigned int payload_off = ip_hdr_len + tcp_hdr_len;
-			if (payload_off < ip_packet_len) {
-				const uint8_t *payload = ip_packet + payload_off;
-				unsigned int payload_len = ip_packet_len - payload_off;
-				if (payload_len >= 5) {
-					fprintf(stderr, "  [TLS RAW] %s -> %s payload_len=%u first_bytes=%02x %02x %02x %02x %02x tcp_seq=%u\n",
-						src_ip, dst_ip,
-						payload_len, payload[0], payload[1], payload[2], payload[3], payload[4],
-						ntohl(tcph->seq));
-				} else if (payload_len > 0) {
-					fprintf(stderr, "  [TLS RAW] %s -> %s payload_len=%u (too short for TLS header)\n",
-						src_ip, dst_ip, payload_len);
-				}
-			}
-		}
-	}
-
-	if (flow->flow->tcp.fingerprint && flow->flow->tcp.fingerprint[0] &&
-	    !flow->tcp_fingerprint[0]) {
-		snprintf(flow->tcp_fingerprint, sizeof(flow->tcp_fingerprint), "%s",
-			 flow->flow->tcp.fingerprint);
-		snprintf(flow->os_hint, sizeof(flow->os_hint), "%s",
-			 ndpi_print_os_hint(flow->flow->tcp.os_hint));
-	}
-
-	if (protocol.protocol_stack.protos_num > 0 && flow->protocol_stack_count == 0) {
-		int stack_count = protocol.protocol_stack.protos_num;
-		if (stack_count > 8)
-			stack_count = 8;
-		flow->protocol_stack_count = stack_count;
-		for (int i = 0; i < stack_count; i++)
-			flow->protocol_stack[i] = protocol.protocol_stack.protos[i];
-	}
-
-	flow->risk = flow->flow->risk;
-	if (flow->risk) {
-		flow->risk_score = ndpi_risk2score(flow->risk,
-			&flow->risk_score_client, &flow->risk_score_server);
-	}
-
-	flow->multimedia_types = flow->flow->flow_multimedia_types;
-
-	if (ctx->verbose) {
-		fprintf(stderr, "  [PKT %d] nDPI process_packet: master=%u (%s) app=%u (%s) category=%s state=%d\n",
-			flow->packets_processed,
-			protocol.proto.master_protocol,
-			ndpi_get_proto_name(ctx->ndpi, protocol.proto.master_protocol),
-			protocol.proto.app_protocol,
-			ndpi_get_proto_name(ctx->ndpi, protocol.proto.app_protocol),
-			ndpi_category_get_name(ctx->ndpi, protocol.category),
-			protocol.state);
-
-		if (flow->tcp_fingerprint[0]) {
-			fprintf(stderr, "  [TCP FP] %s (OS: %s)\n",
-				flow->tcp_fingerprint, flow->os_hint);
-		}
-
-		if (flow->protocol_stack_count > 1) {
-			fprintf(stderr, "  [Stack] ");
-			for (int i = 0; i < flow->protocol_stack_count; i++) {
-				fprintf(stderr, "%s%s", i > 0 ? " -> " : "",
-					ndpi_get_proto_name(ctx->ndpi, flow->protocol_stack[i]));
-			}
-			fprintf(stderr, "\n");
-		}
-
-		if (flow->multimedia_types) {
-			char stream_content[64];
-			if (ndpi_multimedia_flowtype2str(stream_content, sizeof(stream_content),
-							 flow->multimedia_types))
-				fprintf(stderr, "  [Stream] %s\n", stream_content);
-		}
-
-		if (protocol.proto.app_protocol == NDPI_PROTOCOL_TLS && flow->packets_processed <= 10) {
-			fprintf(stderr, "  [TLS] %s -> %s dir0=%d dir1=%d ch=%d sh=%d sni=%s\n",
-				src_ip, dst_ip,
-				flow->packets_dir0, flow->packets_dir1,
-				flow->flow->protos.tls_quic.client_hello_processed,
-				flow->flow->protos.tls_quic.server_hello_processed,
-				flow->flow->host_server_name[0] ? flow->flow->host_server_name : "NONE");
-		}
-	}
-
-	if ((protocol.proto.app_protocol == NDPI_PROTOCOL_DNS ||
-	     packet_view.dst_port == 53) &&
-	    packet_view.protocol == IPPROTO_UDP && flow->packets_processed <= 2) {
-
-		const unsigned char *dns_payload = NULL;
-		unsigned int dns_len = 0;
-
-		if (packet_view.family == FLOW_FAMILY_IPV4) {
-			struct iphdr *iph = (struct iphdr *)ip_packet;
-			unsigned int ip_hdr_len = iph->ihl * 4;
-			if (ip_hdr_len + 8 < ip_packet_len) {
-				dns_payload = ip_packet + ip_hdr_len + 8;
-				dns_len = ip_packet_len - ip_hdr_len - 8;
-			}
-		} else if (packet_view.family == FLOW_FAMILY_IPV6) {
-			if (40 + 8 < ip_packet_len) {
-				dns_payload = ip_packet + 40 + 8;
-				dns_len = ip_packet_len - 40 - 8;
-			}
-		}
-
-		if (dns_payload && dns_len > 0) {
-			char query_name[256];
-			uint16_t qtype = 0;
-
-			if (extract_dns_query_name(dns_payload, dns_len, query_name, sizeof(query_name), &qtype) == 0) {
-				emit_dns_event(ctx, src_ip, query_name, qtype, interface_name_by_index(ctx, sample->ifindex));
-				if (ctx->verbose)
-					fprintf(stderr, "  [DNS] Query: %s from %s\n", query_name, src_ip);
-			}
-		}
-	}
-
-	if (!flow->detection_finalized &&
-	    (protocol.state == NDPI_STATE_CLASSIFIED ||
-	     protocol.state == NDPI_STATE_MONITORING) &&
-	    flow->flow->extra_packets_func == NULL) {
-		flow->detection_finalized = 1;
-		if (ctx->verbose) {
-			fprintf(stderr, "  [PKT %d] Flow finalized via nDPI state=%d\n",
-				flow->packets_processed, protocol.state);
-		}
-	}
-
-	int packets_threshold = ctx->pcap_mode ? 50 : PACKETS_TO_SAMPLE;
-
-	if (!flow->detection_finalized && flow->packets_processed >= packets_threshold) {
-		if (ctx->verbose)
-			fprintf(stderr, "  [PKT %d] Calling ndpi_detection_giveup() [dir0=%d dir1=%d]...\n",
-				flow->packets_processed, flow->packets_dir0, flow->packets_dir1);
-
-		protocol = ndpi_detection_giveup(ctx->ndpi, flow->flow);
-		flow->detection_finalized = 1;
-		flow->protocol_guessed = (protocol.proto.app_protocol != NDPI_PROTOCOL_UNKNOWN);
-
-		if (ctx->verbose) {
-			fprintf(stderr, "  [PKT %d] After giveup (guessed=%d, dir0=%d dir1=%d): master=%u (%s) app=%u (%s)\n",
-				flow->packets_processed,
-				flow->protocol_guessed, flow->packets_dir0, flow->packets_dir1,
-				protocol.proto.master_protocol,
-				ndpi_get_proto_name(ctx->ndpi, protocol.proto.master_protocol),
-				protocol.proto.app_protocol,
-				ndpi_get_proto_name(ctx->ndpi, protocol.proto.app_protocol));
-		}
-	}
-
-	int should_print = 0;
-	int newly_classified = 0;
-	if (protocol.proto.master_protocol != NDPI_PROTOCOL_UNKNOWN ||
-	    protocol.proto.app_protocol != NDPI_PROTOCOL_UNKNOWN) {
-
-		if (flow->protocol.proto.master_protocol != protocol.proto.master_protocol ||
-		    flow->protocol.proto.app_protocol != protocol.proto.app_protocol) {
-			should_print = 1;
-
-			if (flow->protocol.proto.master_protocol == NDPI_PROTOCOL_UNKNOWN &&
-			    flow->protocol.proto.app_protocol == NDPI_PROTOCOL_UNKNOWN)
-				newly_classified = 1;
-
-			if (ctx->verbose) {
-				fprintf(stderr, "  [PKT %d] Classification changed: old master=%u app=%u -> new master=%u app=%u\n",
-					flow->packets_processed,
-					flow->protocol.proto.master_protocol,
-					flow->protocol.proto.app_protocol,
-					protocol.proto.master_protocol,
-					protocol.proto.app_protocol);
-			}
-		}
-
-		flow->protocol = protocol;
-
-		if (newly_classified) {
-			if (tls_quic_metadata_ready(flow)) {
-				emit_classification_event(ctx, flow, interface_name_by_index(ctx, sample->ifindex));
-			} else {
-				flow->classification_event_pending = 1;
-				if (ctx->verbose)
-					fprintf(stderr, "  [PKT %d] Deferring event for TLS/QUIC metadata\n",
-						flow->packets_processed);
-			}
-		} else if (flow->classification_event_pending && tls_quic_metadata_ready(flow)) {
-			emit_classification_event(ctx, flow, interface_name_by_index(ctx, sample->ifindex));
-			flow->classification_event_pending = 0;
-			if (ctx->verbose)
-				fprintf(stderr, "  [PKT %d] Emitting deferred TLS/QUIC event (SNI=%s)\n",
-					flow->packets_processed,
-					flow->flow->host_server_name[0] ? flow->flow->host_server_name : "none");
-		}
-	}
+	flow_process_ndpi_result(ctx, flow, &protocol, &packet_view, ip_packet, ip_packet_len,
+				 src_ip, interface_name_by_index(ctx, sample->ifindex));
 }
 
 static int handle_sample(void *ctx, void *data, size_t len)
@@ -1255,33 +1361,6 @@ int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,
 	return 0;
 }
 
-static void print_flow_stats(int flow_map_fd)
-{
-	struct flow_key key, next_key;
-	struct flow_info info;
-	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
-	int count = 0;
-
-	printf("\n=== Flow Statistics ===\n");
-
-	memset(&key, 0, sizeof(key));
-	while (bpf_map_get_next_key(flow_map_fd, &key, &next_key) == 0) {
-			if (bpf_map_lookup_elem(flow_map_fd, &next_key, &info) == 0) {
-				flow_key_to_strings(&next_key, src_ip, sizeof(src_ip), dst_ip, sizeof(dst_ip));
-
-			printf("Flow: %s:%u -> %s:%u proto=%u packets=%llu bytes=%llu\n",
-			       src_ip, next_key.src_port,
-			       dst_ip, next_key.dst_port,
-			       next_key.protocol,
-			       info.packets, info.bytes);
-			count++;
-		}
-		key = next_key;
-	}
-
-	printf("Total flows: %d\n\n", count);
-}
-
 static void print_classified_flows(struct classifi_ctx *ctx)
 {
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
@@ -1295,18 +1374,10 @@ static void print_classified_flows(struct classifi_ctx *ctx)
 			if (flow->protocol.proto.master_protocol != NDPI_PROTOCOL_UNKNOWN ||
 			    flow->protocol.proto.app_protocol != NDPI_PROTOCOL_UNKNOWN) {
 
-				if (flow->have_first_packet_key)
-					summary_key = flow->first_packet_key;
-				else
-					summary_key = flow->key;
+				summary_key = *flow_display_key(flow);
 
 				flow_key_to_strings(&summary_key, src_ip, sizeof(src_ip), dst_ip, sizeof(dst_ip));
-
-				if (flow->protocol.proto.master_protocol == NDPI_PROTOCOL_UNKNOWN)
-					master_name = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.app_protocol);
-				else
-					master_name = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.master_protocol);
-				app_name = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.app_protocol);
+				flow_get_protocol_names(ctx, flow, &master_name, &app_name);
 
 				const char *category_name = ndpi_category_get_name(ctx->ndpi, flow->protocol.category);
 
@@ -1325,6 +1396,15 @@ static void print_classified_flows(struct classifi_ctx *ctx)
 	}
 }
 
+static void flow_free(struct classifi_ctx *ctx, struct ndpi_flow *flow)
+{
+	if (ctx->flow_map_fd >= 0)
+		bpf_map_delete_elem(ctx->flow_map_fd, &flow->key);
+	if (flow->flow)
+		ndpi_flow_free(flow->flow);
+	free(flow);
+}
+
 void cleanup_expired_flows(struct classifi_ctx *ctx)
 {
 	uint64_t now = monotonic_time_sec();
@@ -1336,49 +1416,37 @@ void cleanup_expired_flows(struct classifi_ctx *ctx)
 		struct ndpi_flow *flow = ctx->flow_table[i];
 
 		while (flow) {
-			total_flows++;
-
+			struct ndpi_flow *next = flow->next;
 			uint64_t idle_time = now - flow->last_seen;
 			uint64_t age = now - flow->first_seen;
 
-			int should_expire = 0;
-			if (idle_time >= FLOW_IDLE_TIMEOUT) {
-				should_expire = 1;
-				if (ctx->verbose)
+			total_flows++;
+
+			if (idle_time < FLOW_IDLE_TIMEOUT && age < FLOW_ABSOLUTE_TIMEOUT) {
+				prev = &flow->next;
+				flow = next;
+				continue;
+			}
+
+			if (ctx->verbose) {
+				if (idle_time >= FLOW_IDLE_TIMEOUT)
 					fprintf(stderr, "expiring idle flow (idle %llu sec)\n",
 						(unsigned long long)idle_time);
-			} else if (age >= FLOW_ABSOLUTE_TIMEOUT) {
-				should_expire = 1;
-				if (ctx->verbose)
+				else
 					fprintf(stderr, "expiring old flow (age %llu sec)\n",
 						(unsigned long long)age);
 			}
 
-			if (should_expire) {
-				struct ndpi_flow *to_free = flow;
-
-				*prev = flow->next;
-				flow = flow->next;
-
-				if (ctx->flow_map_fd >= 0)
-					bpf_map_delete_elem(ctx->flow_map_fd, &to_free->key);
-
-				if (to_free->flow)
-					ndpi_flow_free(to_free->flow);
-				free(to_free);
-
-				expired_flows++;
-			} else {
-				prev = &flow->next;
-				flow = flow->next;
-			}
+			*prev = next;
+			flow_free(ctx, flow);
+			flow = next;
+			expired_flows++;
 		}
 	}
 
-	if (ctx->verbose && expired_flows > 0) {
+	if (ctx->verbose && expired_flows > 0)
 		fprintf(stderr, "flow cleanup: %d active, %d expired\n",
 			total_flows - expired_flows, expired_flows);
-	}
 }
 
 void flow_table_iterate(struct classifi_ctx *ctx, flow_visitor_fn visitor, void *user_data)
@@ -1401,7 +1469,7 @@ static void print_ringbuf_stats(struct classifi_ctx *ctx)
 	    bpf_map_lookup_elem(ctx->ringbuf_stats_fd, &key, &drops) == 0) {
 		if (drops > ctx->last_ringbuf_drops) {
 			__u64 new_drops = drops - ctx->last_ringbuf_drops;
-			fprintf(stderr, "WARNING: Ring buffer dropped %llu packet samples (total: %llu)\n",
+			fprintf(stderr, "warning: ring buffer dropped %llu packet samples (total: %llu)\n",
 				new_drops, drops);
 			ctx->last_ringbuf_drops = drops;
 		}
@@ -1434,103 +1502,184 @@ static void stats_timer_cb(struct uloop_timeout *t)
 	uloop_timeout_set(t, 10 * 1000);
 }
 
+struct classifi_options {
+	const char *iface_names[MAX_INTERFACES];
+	int num_ifaces;
+	const char *bpf_obj_path;
+	const char *dump_filename;
+	const char *replay_filename;
+	int verbose;
+	int periodic_stats;
+	int pcap_mode;
+	int discover_mode;
+};
+
+static void print_usage(const char *prog)
+{
+	fprintf(stderr, "usage: %s [options] <bpf_object.o>\n", prog);
+	fprintf(stderr, "\n");
+	fprintf(stderr, "options:\n");
+	fprintf(stderr, "  -h, --help            Display this help message\n");
+	fprintf(stderr, "  -v, --verbose         Enable verbose output\n");
+	fprintf(stderr, "  -s, --stats           Enable periodic statistics output\n");
+	fprintf(stderr, "  -p, --pcap            Use libpcap mode instead of eBPF\n");
+	fprintf(stderr, "  -i, --interface <if>  Attach to interface (may be repeated)\n");
+	fprintf(stderr, "  -d, --discover        Discover LAN interfaces from UCI config\n");
+	fprintf(stderr, "  -w, --write <file>    Write packet samples to pcapng file\n");
+	fprintf(stderr, "  -r, --read <file>     Replay packets from pcap file\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "modes:\n");
+	fprintf(stderr, "  eBPF mode (default):  requires <bpf_object.o> and at least one interface\n");
+	fprintf(stderr, "  pcap mode (-p):       requires exactly one interface, no BPF object\n");
+	fprintf(stderr, "  replay mode (-r):     replays pcap file for offline analysis\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "examples:\n");
+	fprintf(stderr, "  %s -d /usr/lib/bpf/classifi.bpf.o\n", prog);
+	fprintf(stderr, "      Start in eBPF mode, discover interfaces from UCI\n");
+	fprintf(stderr, "  %s -i br-lan /usr/lib/bpf/classifi.bpf.o\n", prog);
+	fprintf(stderr, "      Start in eBPF mode on br-lan interface\n");
+	fprintf(stderr, "  %s -p -i br-lan\n", prog);
+	fprintf(stderr, "      Start in libpcap mode on br-lan interface\n");
+	fprintf(stderr, "  %s -r capture.pcap\n", prog);
+	fprintf(stderr, "      Replay and analyze packets from capture.pcap\n");
+}
+
+static int parse_args(int argc, char **argv, struct classifi_options *opts)
+{
+	int opt_idx = 1;
+
+	memset(opts, 0, sizeof(*opts));
+
+	while (opt_idx < argc && argv[opt_idx][0] == '-') {
+		if (strcmp(argv[opt_idx], "-h") == 0 ||
+		    strcmp(argv[opt_idx], "--help") == 0) {
+			print_usage(argv[0]);
+			exit(0);
+		}
+
+		if (strcmp(argv[opt_idx], "-v") == 0 ||
+		    strcmp(argv[opt_idx], "--verbose") == 0) {
+			opts->verbose = 1;
+			opt_idx++;
+			continue;
+		}
+
+		if (strcmp(argv[opt_idx], "-s") == 0 ||
+		    strcmp(argv[opt_idx], "--stats") == 0) {
+			opts->periodic_stats = 1;
+			opt_idx++;
+			continue;
+		}
+
+		if (strcmp(argv[opt_idx], "-p") == 0 ||
+		    strcmp(argv[opt_idx], "--pcap") == 0) {
+			opts->pcap_mode = 1;
+			opt_idx++;
+			continue;
+		}
+
+		if (strcmp(argv[opt_idx], "-i") == 0 ||
+		    strcmp(argv[opt_idx], "--interface") == 0) {
+			if (opt_idx + 1 >= argc) {
+				fprintf(stderr, "option %s requires an interface name\n", argv[opt_idx]);
+				return -1;
+			}
+			if (opts->num_ifaces >= MAX_INTERFACES) {
+				fprintf(stderr, "too many interfaces (max %d)\n", MAX_INTERFACES);
+				return -1;
+			}
+			opts->iface_names[opts->num_ifaces++] = argv[opt_idx + 1];
+			opt_idx += 2;
+			continue;
+		}
+
+		if (strcmp(argv[opt_idx], "-d") == 0 ||
+		    strcmp(argv[opt_idx], "--discover") == 0) {
+			opts->num_ifaces = discover_interfaces_from_uci(opts->iface_names, MAX_INTERFACES);
+			opts->discover_mode = 1;
+			opt_idx++;
+			continue;
+		}
+
+		if (strcmp(argv[opt_idx], "-w") == 0 ||
+		    strcmp(argv[opt_idx], "--write") == 0) {
+			if (opt_idx + 1 >= argc) {
+				fprintf(stderr, "option %s requires a filename\n", argv[opt_idx]);
+				return -1;
+			}
+			opts->dump_filename = argv[opt_idx + 1];
+			opt_idx += 2;
+			continue;
+		}
+
+		if (strcmp(argv[opt_idx], "-r") == 0 ||
+		    strcmp(argv[opt_idx], "--read") == 0) {
+			if (opt_idx + 1 >= argc) {
+				fprintf(stderr, "option %s requires a filename\n", argv[opt_idx]);
+				return -1;
+			}
+			opts->replay_filename = argv[opt_idx + 1];
+			opt_idx += 2;
+			continue;
+		}
+
+		fprintf(stderr, "unknown option: %s\n\n", argv[opt_idx]);
+		print_usage(argv[0]);
+		return -1;
+	}
+
+	if (opts->replay_filename) {
+		if (opts->pcap_mode) {
+			fprintf(stderr, "-r and -p are mutually exclusive\n");
+			return -1;
+		}
+		return 0;
+	}
+
+	if (opts->pcap_mode) {
+		if (opts->num_ifaces != 1) {
+			print_usage(argv[0]);
+			fprintf(stderr, "\nerror: pcap mode requires exactly one interface\n");
+			return -1;
+		}
+		if (opts->dump_filename) {
+			fprintf(stderr, "warning: -w ignored in pcap mode\n");
+			opts->dump_filename = NULL;
+		}
+		return 0;
+	}
+
+	if (opts->num_ifaces < 1) {
+		fprintf(stderr, "no interfaces specified. Use -i <interface> or -d to discover.\n");
+		return -1;
+	}
+
+	if (argc - opt_idx < 1) {
+		print_usage(argv[0]);
+		fprintf(stderr, "\nerror: BPF object file required\n");
+		return -1;
+	}
+
+	opts->bpf_obj_path = argv[opt_idx];
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct classifi_ctx ctx = {0};
+	struct classifi_options opts;
 	struct bpf_program *prog;
 	int prog_fd, samples_fd;
 	int err = 0;
-	const char *bpf_obj_path;
-	const char *iface_names[MAX_INTERFACES];
-	int num_iface_names = 0;
-	int discover_mode = 0;
-	const char *dump_filename = NULL;
-	const char *replay_filename = NULL;
-	int opt_idx = 1;
 
 	signal(SIGCHLD, SIG_IGN);
 
-	while (opt_idx < argc && argv[opt_idx][0] == '-') {
-		if (strcmp(argv[opt_idx], "-v") == 0 ||
-		    strcmp(argv[opt_idx], "--verbose") == 0) {
-			ctx.verbose = 1;
-			opt_idx++;
-		} else if (strcmp(argv[opt_idx], "-s") == 0 ||
-		           strcmp(argv[opt_idx], "--stats") == 0) {
-			ctx.periodic_stats = 1;
-			opt_idx++;
-		} else if (strcmp(argv[opt_idx], "-p") == 0 ||
-		           strcmp(argv[opt_idx], "--pcap") == 0) {
-			ctx.pcap_mode = 1;
-			opt_idx++;
-		} else if (strcmp(argv[opt_idx], "-i") == 0 ||
-		           strcmp(argv[opt_idx], "--interface") == 0) {
-			if (opt_idx + 1 >= argc) {
-				fprintf(stderr, "option %s requires an interface name\n", argv[opt_idx]);
-				return 1;
-			}
-			if (num_iface_names >= MAX_INTERFACES) {
-				fprintf(stderr, "too many interfaces (max %d)\n", MAX_INTERFACES);
-				return 1;
-			}
-			iface_names[num_iface_names++] = argv[opt_idx + 1];
-			opt_idx += 2;
-		} else if (strcmp(argv[opt_idx], "-d") == 0 ||
-		           strcmp(argv[opt_idx], "--discover") == 0) {
-			num_iface_names = discover_interfaces_from_uci(iface_names, MAX_INTERFACES);
-			discover_mode = 1;
-			opt_idx++;
-		} else if (strcmp(argv[opt_idx], "-w") == 0 ||
-		           strcmp(argv[opt_idx], "--write") == 0) {
-			if (opt_idx + 1 >= argc) {
-				fprintf(stderr, "option %s requires a filename\n", argv[opt_idx]);
-				return 1;
-			}
-			dump_filename = argv[opt_idx + 1];
-			opt_idx += 2;
-		} else if (strcmp(argv[opt_idx], "-r") == 0 ||
-		           strcmp(argv[opt_idx], "--read") == 0) {
-			if (opt_idx + 1 >= argc) {
-				fprintf(stderr, "option %s requires a filename\n", argv[opt_idx]);
-				return 1;
-			}
-			replay_filename = argv[opt_idx + 1];
-			opt_idx += 2;
-		} else {
-			fprintf(stderr, "unknown option: %s\n", argv[opt_idx]);
-			fprintf(stderr, "usage: %s [-v] [-s] [-p] [-r <file>] [-d] [-w <file>] -i <interface> [...] <bpf_object.o>\n", argv[0]);
-			return 1;
-		}
-	}
+	if (parse_args(argc, argv, &opts) < 0)
+		return 1;
 
-	if (replay_filename) {
-		if (ctx.pcap_mode) {
-			fprintf(stderr, "-r and -p are mutually exclusive\n");
-			return 1;
-		}
-		bpf_obj_path = NULL;
-	} else if (ctx.pcap_mode) {
-		if (num_iface_names != 1) {
-			fprintf(stderr, "usage (pcap mode): %s [-v] [-s] -p -i <interface>\n", argv[0]);
-			fprintf(stderr, "PCAP mode requires exactly one interface\n");
-			return 1;
-		}
-		if (dump_filename) {
-			fprintf(stderr, "warning: -w ignored in pcap mode\n");
-			dump_filename = NULL;
-		}
-		bpf_obj_path = NULL;
-	} else {
-		if (num_iface_names < 1) {
-			fprintf(stderr, "no interfaces specified. Use -i <interface> or -d to discover.\n");
-			return 1;
-		}
-		if (argc - opt_idx < 1) {
-			fprintf(stderr, "usage (eBPF mode): %s [-v] [-s] [-d] [-w <file>] -i <interface> [...] <bpf_object.o>\n", argv[0]);
-			return 1;
-		}
-		bpf_obj_path = argv[opt_idx];
-	}
+	ctx.verbose = opts.verbose;
+	ctx.periodic_stats = opts.periodic_stats;
+	ctx.pcap_mode = opts.pcap_mode;
 
 	setup_signals();
 
@@ -1554,20 +1703,20 @@ int main(int argc, char **argv)
 
 	rules_load_from_uci(&ctx);
 
-	if (replay_filename) {
-		err = run_pcap_replay(&ctx, replay_filename);
+	if (opts.replay_filename) {
+		err = run_pcap_replay(&ctx, opts.replay_filename);
 		goto cleanup;
 	}
 
 	if (ctx.pcap_mode) {
-		ctx.pcap_ifname = iface_names[0];
-		err = run_pcap_mode(&ctx, iface_names[0]);
+		ctx.pcap_ifname = opts.iface_names[0];
+		err = run_pcap_mode(&ctx, opts.iface_names[0]);
 		goto cleanup;
 	}
 
-	ctx.bpf_obj = bpf_object__open_file(bpf_obj_path, NULL);
+	ctx.bpf_obj = bpf_object__open_file(opts.bpf_obj_path, NULL);
 	if (libbpf_get_error(ctx.bpf_obj)) {
-		fprintf(stderr, "failed to open BPF object: %s\n", bpf_obj_path);
+		fprintf(stderr, "failed to open BPF object: %s\n", opts.bpf_obj_path);
 		ctx.bpf_obj = NULL;
 		return 1;
 	}
@@ -1600,16 +1749,16 @@ int main(int argc, char **argv)
 
 	ctx.bpf_prog_fd = prog_fd;
 
-	for (int i = 0; i < num_iface_names; i++) {
-		if (attach_tc_program(&ctx, prog_fd, iface_names[i], discover_mode) < 0) {
-			fprintf(stderr, "failed to attach program to interface %s\n", iface_names[i]);
+	for (int i = 0; i < opts.num_ifaces; i++) {
+		if (attach_tc_program(&ctx, prog_fd, opts.iface_names[i], opts.discover_mode) < 0) {
+			fprintf(stderr, "failed to attach program to interface %s\n", opts.iface_names[i]);
 			goto cleanup;
 		}
 		get_interface_ip(&ctx.interfaces[ctx.num_interfaces - 1]);
 	}
 
-	if (dump_filename) {
-		ctx.dump = dump_open(dump_filename);
+	if (opts.dump_filename) {
+		ctx.dump = dump_open(opts.dump_filename);
 		if (!ctx.dump) {
 			fprintf(stderr, "failed to open dump file, continuing without pcapng output\n");
 		} else {
