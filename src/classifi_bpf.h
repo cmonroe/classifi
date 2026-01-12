@@ -25,10 +25,10 @@
 /*
  * GRO can coalesce multiple TCP segments into a single skb, producing
  * packets larger than MTU. TLS ClientHello with many extensions or
- * certificate data can span multiple segments. 4096 bytes captures
+ * certificate data can span multiple segments. 8192 bytes captures
  * these coalesced packets for proper nDPI reassembly and classification.
  */
-#define MAX_PACKET_SAMPLE 4096
+#define MAX_PACKET_SAMPLE 8192
 #define PACKETS_TO_SAMPLE 50
 
 #define FLOW_FAMILY_IPV4 4
