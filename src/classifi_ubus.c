@@ -385,6 +385,9 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 	blobmsg_add_string(b, "master_protocol", master_name);
 	blobmsg_add_string(b, "app_protocol", app_name);
 	blobmsg_add_string(b, "category", category_name);
+	if (flow->protocol.protocol_by_ip != NDPI_PROTOCOL_UNKNOWN)
+		blobmsg_add_string(b, "protocol_by_ip",
+				   ndpi_get_proto_name(ctx->ndpi, flow->protocol.protocol_by_ip));
 
 	blobmsg_add_u32(b, "packets", flow->packets_processed);
 	blobmsg_add_u32(b, "packets_tx", flow->packets_dir0);

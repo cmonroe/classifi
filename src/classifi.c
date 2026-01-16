@@ -409,6 +409,9 @@ void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 	blobmsg_add_string(&b, "master_protocol", master_name);
 	blobmsg_add_string(&b, "app_protocol", app_name);
 	blobmsg_add_string(&b, "category", category_name);
+	if (flow->protocol.protocol_by_ip != NDPI_PROTOCOL_UNKNOWN)
+		blobmsg_add_string(&b, "protocol_by_ip",
+				   ndpi_get_proto_name(ctx->ndpi, flow->protocol.protocol_by_ip));
 
 	if (flow->tcp_fingerprint[0])
 		blobmsg_add_string(&b, "tcp_fingerprint", flow->tcp_fingerprint);
@@ -815,6 +818,7 @@ void flow_get_protocol_names(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 		*master = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.app_protocol);
 	else
 		*master = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.master_protocol);
+
 	*app = ndpi_get_proto_name(ctx->ndpi, flow->protocol.proto.app_protocol);
 }
 
