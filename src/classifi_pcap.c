@@ -41,6 +41,32 @@ struct vlan_hdr {
 	__u16 h_vlan_encapsulated_proto;
 } __attribute__((packed));
 
+static int transport_ports_extract(const unsigned char *ptr, int offset, int packet_len,
+				   __u8 protocol, struct flow_key *key)
+{
+	if (protocol == IPPROTO_TCP) {
+		const struct tcphdr *tcph;
+
+		if (offset + sizeof(struct tcphdr) > packet_len)
+			return 0;
+
+		tcph = (struct tcphdr *)ptr;
+		key->src_port = ntohs(tcph->source);
+		key->dst_port = ntohs(tcph->dest);
+	} else if (protocol == IPPROTO_UDP) {
+		const struct udphdr *udph;
+
+		if (offset + sizeof(struct udphdr) > packet_len)
+			return 0;
+
+		udph = (struct udphdr *)ptr;
+		key->src_port = ntohs(udph->source);
+		key->dst_port = ntohs(udph->dest);
+	}
+
+	return 0;
+}
+
 static int parse_packet_libpcap(const unsigned char *packet, int packet_len,
 				struct flow_key *key, unsigned char **l3_data,
 				unsigned int *l3_len)
@@ -103,27 +129,7 @@ static int parse_packet_libpcap(const unsigned char *packet, int packet_len,
 		offset += ip_hdr_len;
 		ptr = packet + offset;
 
-		if (iph->protocol == IPPROTO_TCP) {
-			const struct tcphdr *tcph;
-
-			if (offset + sizeof(struct tcphdr) > packet_len)
-				return 0;
-
-			tcph = (struct tcphdr *)ptr;
-			key->src_port = ntohs(tcph->source);
-			key->dst_port = ntohs(tcph->dest);
-		} else if (iph->protocol == IPPROTO_UDP) {
-			const struct udphdr *udph;
-
-			if (offset + sizeof(struct udphdr) > packet_len)
-				return 0;
-
-			udph = (struct udphdr *)ptr;
-			key->src_port = ntohs(udph->source);
-			key->dst_port = ntohs(udph->dest);
-		}
-
-		return 0;
+		return transport_ports_extract(ptr, offset, packet_len, iph->protocol, key);
 	}
 
 	if (eth_type == ETH_P_IPV6) {
@@ -145,27 +151,7 @@ static int parse_packet_libpcap(const unsigned char *packet, int packet_len,
 		offset += sizeof(struct ipv6hdr);
 		ptr = packet + offset;
 
-		if (ip6h->nexthdr == IPPROTO_TCP) {
-			const struct tcphdr *tcph;
-
-			if (offset + sizeof(struct tcphdr) > packet_len)
-				return 0;
-
-			tcph = (struct tcphdr *)ptr;
-			key->src_port = ntohs(tcph->source);
-			key->dst_port = ntohs(tcph->dest);
-		} else if (ip6h->nexthdr == IPPROTO_UDP) {
-			const struct udphdr *udph;
-
-			if (offset + sizeof(struct udphdr) > packet_len)
-				return 0;
-
-			udph = (struct udphdr *)ptr;
-			key->src_port = ntohs(udph->source);
-			key->dst_port = ntohs(udph->dest);
-		}
-
-		return 0;
+		return transport_ports_extract(ptr, offset, packet_len, ip6h->nexthdr, key);
 	}
 
 	return -1;

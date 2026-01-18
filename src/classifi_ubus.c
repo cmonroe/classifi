@@ -403,6 +403,14 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 		blobmsg_add_string(b, "tcp_fingerprint", flow->tcp_fingerprint);
 	if (flow->os_hint[0])
 		blobmsg_add_string(b, "os_hint", flow->os_hint);
+	if (flow->ja4_fingerprint[0])
+		blobmsg_add_string(b, "ja4", flow->ja4_fingerprint);
+	if (flow->ja4_client[0])
+		blobmsg_add_string(b, "ja4_client", flow->ja4_client);
+	if (flow->ndpi_fingerprint[0])
+		blobmsg_add_string(b, "ndpi_fingerprint", flow->ndpi_fingerprint);
+	if (flow->detection_method[0])
+		blobmsg_add_string(b, "detection_method", flow->detection_method);
 	if (flow->flow->host_server_name[0])
 		blobmsg_add_string(b, "hostname", flow->flow->host_server_name);
 
@@ -422,11 +430,8 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 	}
 
 	if (flow->protocol_stack_count > 1) {
-		int stack_count = flow->protocol_stack_count;
-		if (stack_count > MAX_PROTOCOL_STACK_SIZE)
-			stack_count = MAX_PROTOCOL_STACK_SIZE;
 		stack_array = blobmsg_open_array(b, "protocol_stack");
-		for (int j = 0; j < stack_count; j++)
+		for (int j = 0; j < flow->protocol_stack_count; j++)
 			blobmsg_add_string(b, NULL, ndpi_get_proto_name(ctx->ndpi, flow->protocol_stack[j]));
 		blobmsg_close_array(b, stack_array);
 	}

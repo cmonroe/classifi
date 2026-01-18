@@ -20,11 +20,18 @@
 #include <ndpi/ndpi_api.h>
 #include <bpf/libbpf.h>
 #include <libubox/uloop.h>
+#include <libubox/avl.h>
 #include <libubus.h>
 
 #include "classifi_bpf.h"
 
 struct dump_writer;
+
+struct ja4_entry {
+	struct avl_node node;
+	char fingerprint[40];
+	char client[64];
+};
 
 #define MAX_RULES 32
 #define MAX_PATTERN_LEN 256
@@ -100,6 +107,10 @@ struct ndpi_flow {
 	uint64_t last_seen;
 	char tcp_fingerprint[64];
 	char os_hint[32];
+	char ja4_fingerprint[40];
+	char ndpi_fingerprint[36];
+	char ja4_client[64];
+	char detection_method[32];
 	int protocol_stack_count;
 	u_int16_t protocol_stack[MAX_PROTOCOL_STACK_SIZE];
 	__u32 rules_matched;
@@ -123,6 +134,9 @@ static inline struct flow_key *flow_display_key(struct ndpi_flow *flow)
 
 struct classifi_ctx {
 	struct ndpi_detection_module_struct *ndpi;
+
+	struct avl_tree ja4_table;
+	int ja4_entries;
 
 	struct ndpi_flow *flow_table[FLOW_TABLE_SIZE];
 
@@ -181,7 +195,8 @@ int extract_dns_query_name(const unsigned char *dns_payload, unsigned int len,
 			   char *out, size_t out_len, uint16_t *qtype);
 void cleanup_expired_flows(struct classifi_ctx *ctx);
 
-void flow_update_metadata(struct ndpi_flow *flow, ndpi_protocol *protocol);
+void flow_update_metadata(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			  ndpi_protocol *protocol);
 void flow_get_protocol_names(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			     const char **master, const char **app);
 void flow_check_dns_query(struct classifi_ctx *ctx, struct ndpi_flow *flow,
@@ -204,6 +219,10 @@ struct interface_info *interface_by_name(struct classifi_ctx *ctx, const char *n
 int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,
 		      const char *ifname, int discovered);
 int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface);
+
+int ja4_table_load(struct classifi_ctx *ctx, const char *path);
+const char *ja4_table_lookup(struct classifi_ctx *ctx, const char *fingerprint);
+void ja4_table_free(struct classifi_ctx *ctx);
 
 extern volatile int keep_running;
 

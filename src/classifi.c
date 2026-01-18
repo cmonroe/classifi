@@ -365,22 +365,21 @@ int get_interface_ip(struct interface_info *iface)
 	return found ? 0 : -1;
 }
 
+static int is_tls_or_quic(u_int16_t proto)
+{
+	return proto == NDPI_PROTOCOL_TLS || proto == NDPI_PROTOCOL_QUIC;
+}
+
 int tls_quic_metadata_ready(struct ndpi_flow *flow)
 {
 	u_int16_t master = flow->protocol.proto.master_protocol;
 	u_int16_t app = flow->protocol.proto.app_protocol;
 
-	if (master != NDPI_PROTOCOL_TLS && master != NDPI_PROTOCOL_QUIC &&
-	    app != NDPI_PROTOCOL_TLS && app != NDPI_PROTOCOL_QUIC)
+	if (!is_tls_or_quic(master) && !is_tls_or_quic(app))
 		return 1;
 
-	if (flow->detection_finalized)
-		return 1;
-
-	if (flow->flow->protos.tls_quic.client_hello_processed)
-		return 1;
-
-	return 0;
+	return flow->detection_finalized ||
+	       flow->flow->protos.tls_quic.client_hello_processed;
 }
 
 void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow, const char *ifname)
@@ -417,6 +416,14 @@ void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 		blobmsg_add_string(&b, "tcp_fingerprint", flow->tcp_fingerprint);
 	if (flow->os_hint[0])
 		blobmsg_add_string(&b, "os_hint", flow->os_hint);
+	if (flow->ja4_fingerprint[0])
+		blobmsg_add_string(&b, "ja4", flow->ja4_fingerprint);
+	if (flow->ja4_client[0])
+		blobmsg_add_string(&b, "ja4_client", flow->ja4_client);
+	if (flow->ndpi_fingerprint[0])
+		blobmsg_add_string(&b, "ndpi_fingerprint", flow->ndpi_fingerprint);
+	if (flow->detection_method[0])
+		blobmsg_add_string(&b, "detection_method", flow->detection_method);
 	if (flow->flow->host_server_name[0])
 		blobmsg_add_string(&b, "hostname", flow->flow->host_server_name);
 
@@ -781,9 +788,12 @@ static const unsigned char *dns_payload_extract(const unsigned char *l3_data,
 	return l3_data + offset;
 }
 
-void flow_update_metadata(struct ndpi_flow *flow, ndpi_protocol *protocol)
+void flow_update_metadata(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			  ndpi_protocol *protocol)
 {
 	int stack_count;
+	const char *method;
+	const char *ja4_client;
 
 	if (flow->flow->tcp.fingerprint && flow->flow->tcp.fingerprint[0] &&
 	    !flow->tcp_fingerprint[0]) {
@@ -792,6 +802,19 @@ void flow_update_metadata(struct ndpi_flow *flow, ndpi_protocol *protocol)
 		snprintf(flow->os_hint, sizeof(flow->os_hint), "%s",
 			 ndpi_print_os_hint(flow->flow->tcp.os_hint));
 	}
+
+	if (flow->flow->protos.tls_quic.ja4_client[0] && !flow->ja4_fingerprint[0]) {
+		snprintf(flow->ja4_fingerprint, sizeof(flow->ja4_fingerprint), "%s",
+			 flow->flow->protos.tls_quic.ja4_client);
+
+		ja4_client = ja4_table_lookup(ctx, flow->ja4_fingerprint);
+		if (ja4_client && !flow->ja4_client[0])
+			snprintf(flow->ja4_client, sizeof(flow->ja4_client), "%s", ja4_client);
+	}
+
+	if (flow->flow->ndpi.fingerprint && !flow->ndpi_fingerprint[0])
+		snprintf(flow->ndpi_fingerprint, sizeof(flow->ndpi_fingerprint), "%s",
+			 flow->flow->ndpi.fingerprint);
 
 	if (protocol->protocol_stack.protos_num > 0 && flow->protocol_stack_count == 0) {
 		stack_count = protocol->protocol_stack.protos_num;
@@ -809,6 +832,13 @@ void flow_update_metadata(struct ndpi_flow *flow, ndpi_protocol *protocol)
 			&flow->risk_score_client, &flow->risk_score_server);
 
 	flow->multimedia_types = flow->flow->flow_multimedia_types;
+
+	if (flow->flow->confidence != NDPI_CONFIDENCE_UNKNOWN) {
+		method = ndpi_confidence_get_name(flow->flow->confidence);
+		if (method)
+			snprintf(flow->detection_method, sizeof(flow->detection_method),
+				 "%s", method);
+	}
 }
 
 void flow_get_protocol_names(struct classifi_ctx *ctx, struct ndpi_flow *flow,
@@ -947,7 +977,7 @@ void flow_process_ndpi_result(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			      const unsigned char *l3_data, unsigned int l3_len,
 			      const char *src_ip, const char *ifname)
 {
-	flow_update_metadata(flow, protocol);
+	flow_update_metadata(ctx, flow, protocol);
 
 	if (ctx->verbose && (flow->packets_processed <= PACKETS_TO_SAMPLE ||
 			     flow->packets_processed % 20 == 0)) {
@@ -1018,6 +1048,97 @@ int flow_handle_classification(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 	return newly_classified;
 }
 
+static int ja4_avl_cmp(const void *k1, const void *k2, void *ptr)
+{
+	(void)ptr;
+	return strcmp(k1, k2);
+}
+
+int ja4_table_load(struct classifi_ctx *ctx, const char *path)
+{
+	FILE *fp;
+	char line[256];
+	int count = 0;
+
+	avl_init(&ctx->ja4_table, ja4_avl_cmp, false, NULL);
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		struct ja4_entry *entry;
+		char *p, *at;
+
+		p = line;
+		while (*p == ' ' || *p == '\t')
+			p++;
+
+		if (*p == '#' || *p == '\n' || *p == '\0')
+			continue;
+
+		if (strncmp(p, "ja4:", 4) != 0)
+			continue;
+
+		p += 4;
+
+		at = strchr(p, '@');
+		if (!at)
+			continue;
+
+		at[strcspn(at, "\r\n")] = '\0';
+
+		entry = calloc(1, sizeof(*entry));
+		if (!entry)
+			continue;
+
+		*at = '\0';
+		snprintf(entry->fingerprint, sizeof(entry->fingerprint), "%s", p);
+		snprintf(entry->client, sizeof(entry->client), "%s", at + 1);
+
+		entry->node.key = entry->fingerprint;
+		if (avl_insert(&ctx->ja4_table, &entry->node) != 0) {
+			free(entry);
+			continue;
+		}
+
+		count++;
+	}
+
+	fclose(fp);
+	ctx->ja4_entries = count;
+
+	return count;
+}
+
+const char *ja4_table_lookup(struct classifi_ctx *ctx, const char *fingerprint)
+{
+	struct ja4_entry *entry;
+	struct avl_node *node;
+
+	if (!fingerprint || !fingerprint[0])
+		return NULL;
+
+	node = avl_find(&ctx->ja4_table, fingerprint);
+	if (!node)
+		return NULL;
+
+	entry = container_of(node, struct ja4_entry, node);
+	return entry->client;
+}
+
+void ja4_table_free(struct classifi_ctx *ctx)
+{
+	struct ja4_entry *entry, *tmp;
+
+	avl_for_each_element_safe(&ctx->ja4_table, entry, node, tmp) {
+		avl_delete(&ctx->ja4_table, &entry->node);
+		free(entry);
+	}
+
+	ctx->ja4_entries = 0;
+}
+
 static struct ndpi_detection_module_struct *setup_ndpi(void)
 {
 	struct ndpi_detection_module_struct *ndpi_struct;
@@ -1049,6 +1170,20 @@ static struct ndpi_detection_module_struct *setup_ndpi(void)
 	ndpi_set_config(ndpi_struct, NULL, "hostname_dns_check", "1");
 	ndpi_set_config(ndpi_struct, NULL, "metadata.tcp_fingerprint", "1");
 	ndpi_set_config(ndpi_struct, "tls", "blocks_analysis", "1");
+
+	ndpi_set_config(ndpi_struct, NULL, "metadata.ndpi_fingerprint", "enable");
+	ndpi_set_config(ndpi_struct, NULL, "metadata.ndpi_fingerprint_format", "1");
+
+	/*
+	 * Disabled for now: nDPI's ja4 custom rules (from protos.txt) overwrite
+	 * app_protocol with client identification (e.g., "Safari"), losing service
+	 * detection (e.g., "Microsoft365"). We handle JA4 client lookup separately
+	 * via ja4_table_load() to preserve both pieces of information. Needs more
+	 * research to determine if nDPI can be configured to augment rather than
+	 * replace app_protocol.
+	 */
+	//if (ndpi_load_protocols_file(ndpi_struct, "/etc/classifi/protos.txt") < 0)
+	//	fprintf(stderr, "warning: failed to load /etc/classifi/protos.txt\n");
 
 	if (ndpi_finalize_initialization(ndpi_struct) != 0) {
 		fprintf(stderr, "failed to finalize nDPI initialization\n");
@@ -1707,6 +1842,9 @@ int main(int argc, char **argv)
 
 	rules_load_from_uci(&ctx);
 
+	if (ja4_table_load(&ctx, "/etc/classifi/protos.txt") > 0)
+		printf("loaded %d JA4 fingerprint(s) from protos.txt\n", ctx.ja4_entries);
+
 	if (opts.replay_filename) {
 		err = run_pcap_replay(&ctx, opts.replay_filename);
 		goto cleanup;
@@ -1816,6 +1954,7 @@ cleanup:
 	bpf_object__close(ctx.bpf_obj);
 	cleanup_flow_table(&ctx);
 	rules_free(&ctx);
+	ja4_table_free(&ctx);
 	if (ctx.dump) {
 		dump_close(ctx.dump);
 		ctx.dump = NULL;
