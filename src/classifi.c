@@ -382,6 +382,32 @@ int tls_quic_metadata_ready(struct ndpi_flow *flow)
 	       flow->flow->protos.tls_quic.client_hello_processed;
 }
 
+void geoip_flow_resolve(struct classifi_ctx *ctx, struct ndpi_flow *flow)
+{
+	struct flow_key *key;
+	char ip_str[INET6_ADDRSTRLEN];
+
+	if (!ctx->geoip_loaded)
+		return;
+
+	if (flow->src_country[0] || flow->dst_country[0])
+		return;
+
+	key = flow_display_key(flow);
+
+	flow_addr_to_string(&key->src, key->family, ip_str, sizeof(ip_str));
+	ndpi_get_geoip_country_continent(ctx->ndpi, ip_str,
+		flow->src_country, sizeof(flow->src_country), NULL, 0);
+	ndpi_get_geoip_asn(ctx->ndpi, ip_str, &flow->src_asn);
+	ndpi_get_geoip_aso(ctx->ndpi, ip_str, flow->src_aso, sizeof(flow->src_aso));
+
+	flow_addr_to_string(&key->dst, key->family, ip_str, sizeof(ip_str));
+	ndpi_get_geoip_country_continent(ctx->ndpi, ip_str,
+		flow->dst_country, sizeof(flow->dst_country), NULL, 0);
+	ndpi_get_geoip_asn(ctx->ndpi, ip_str, &flow->dst_asn);
+	ndpi_get_geoip_aso(ctx->ndpi, ip_str, flow->dst_aso, sizeof(flow->dst_aso));
+}
+
 void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow, const char *ifname)
 {
 	struct blob_buf b = {};
@@ -426,6 +452,19 @@ void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 		blobmsg_add_string(&b, "detection_method", flow->detection_method);
 	if (flow->flow->host_server_name[0])
 		blobmsg_add_string(&b, "hostname", flow->flow->host_server_name);
+
+	if (flow->src_country[0])
+		blobmsg_add_string(&b, "src_country", flow->src_country);
+	if (flow->dst_country[0])
+		blobmsg_add_string(&b, "dst_country", flow->dst_country);
+	if (flow->src_asn)
+		blobmsg_add_u32(&b, "src_asn", flow->src_asn);
+	if (flow->dst_asn)
+		blobmsg_add_u32(&b, "dst_asn", flow->dst_asn);
+	if (flow->src_aso[0])
+		blobmsg_add_string(&b, "src_aso", flow->src_aso);
+	if (flow->dst_aso[0])
+		blobmsg_add_string(&b, "dst_aso", flow->dst_aso);
 
 	if (flow->protocol_stack_count > 1) {
 		void *stack = blobmsg_open_array(&b, "protocol_stack");
@@ -1029,6 +1068,7 @@ int flow_handle_classification(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 
 	if (newly_classified) {
 		if (tls_quic_metadata_ready(flow)) {
+			geoip_flow_resolve(ctx, flow);
 			emit_classification_event(ctx, flow, ifname);
 		} else {
 			flow->classification_event_pending = 1;
@@ -1037,6 +1077,7 @@ int flow_handle_classification(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 					flow->packets_processed);
 		}
 	} else if (flow->classification_event_pending && tls_quic_metadata_ready(flow)) {
+		geoip_flow_resolve(ctx, flow);
 		emit_classification_event(ctx, flow, ifname);
 		flow->classification_event_pending = 0;
 		if (ctx->verbose)
@@ -1844,6 +1885,23 @@ int main(int argc, char **argv)
 
 	if (ja4_table_load(&ctx, "/etc/classifi/protos.txt") > 0)
 		printf("loaded %d JA4 fingerprint(s) from protos.txt\n", ctx.ja4_entries);
+
+	{
+		int geoip_rc;
+
+		geoip_rc = ndpi_load_geoip(ctx.ndpi,
+			"/usr/share/geoip/ip-to-country.mmdb",
+			"/usr/share/geoip/ip-to-asn.mmdb");
+		if (geoip_rc == 0) {
+			ctx.geoip_loaded = 1;
+			printf("loaded GeoIP country and ASN databases\n");
+		} else if (geoip_rc == -2) {
+			ctx.geoip_loaded = 1;
+			printf("loaded GeoIP country database (ASN database not available)\n");
+		} else {
+			fprintf(stderr, "warning: GeoIP databases not available, country/ASN lookups disabled\n");
+		}
+	}
 
 	if (opts.replay_filename) {
 		err = run_pcap_replay(&ctx, opts.replay_filename);

@@ -414,6 +414,19 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 	if (flow->flow->host_server_name[0])
 		blobmsg_add_string(b, "hostname", flow->flow->host_server_name);
 
+	if (flow->src_country[0])
+		blobmsg_add_string(b, "src_country", flow->src_country);
+	if (flow->dst_country[0])
+		blobmsg_add_string(b, "dst_country", flow->dst_country);
+	if (flow->src_asn)
+		blobmsg_add_u32(b, "src_asn", flow->src_asn);
+	if (flow->dst_asn)
+		blobmsg_add_u32(b, "dst_asn", flow->dst_asn);
+	if (flow->src_aso[0])
+		blobmsg_add_string(b, "src_aso", flow->src_aso);
+	if (flow->dst_aso[0])
+		blobmsg_add_string(b, "dst_aso", flow->dst_aso);
+
 	if (flow->risk) {
 		void *risks_array;
 
@@ -490,6 +503,7 @@ classifi_status_handler(struct ubus_context *uctx, struct ubus_object *obj,
 	blob_buf_init(&b, 0);
 
 	blobmsg_add_string(&b, "mode", g_ctx->pcap_mode ? "pcap" : "ebpf");
+	blobmsg_add_u8(&b, "geoip_loaded", g_ctx->geoip_loaded);
 	blobmsg_add_u8(&b, "verbose", g_ctx->verbose);
 	blobmsg_add_u8(&b, "periodic_stats", g_ctx->periodic_stats);
 

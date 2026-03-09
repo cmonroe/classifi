@@ -111,6 +111,12 @@ struct ndpi_flow {
 	char ndpi_fingerprint[36];
 	char ja4_client[64];
 	char detection_method[32];
+	char src_country[4];
+	char dst_country[4];
+	uint32_t src_asn;
+	uint32_t dst_asn;
+	char src_aso[64];
+	char dst_aso[64];
 	int protocol_stack_count;
 	u_int16_t protocol_stack[MAX_PROTOCOL_STACK_SIZE];
 	__u32 rules_matched;
@@ -161,6 +167,7 @@ struct classifi_ctx {
 	int verbose;
 	int periodic_stats;
 	int pcap_mode;
+	int geoip_loaded;
 
 	const char *pcap_ifname;
 
@@ -223,6 +230,8 @@ int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface);
 int ja4_table_load(struct classifi_ctx *ctx, const char *path);
 const char *ja4_table_lookup(struct classifi_ctx *ctx, const char *fingerprint);
 void ja4_table_free(struct classifi_ctx *ctx);
+
+void geoip_flow_resolve(struct classifi_ctx *ctx, struct ndpi_flow *flow);
 
 extern volatile int keep_running;
 
