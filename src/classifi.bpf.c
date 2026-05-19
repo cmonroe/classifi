@@ -193,6 +193,10 @@ static __always_inline void sample_packet(struct __sk_buff *skb,
 		len = MAX_PACKET_SAMPLE;
 
 	if (len == 0 || bpf_skb_load_bytes(skb, 0, sample->data, len) < 0) {
+		__u32 stats_key = 0;
+		__u64 *count = bpf_map_lookup_elem(&ringbuf_stats, &stats_key);
+		if (count)
+			__sync_fetch_and_add(count, 1);
 		bpf_ringbuf_discard(sample, 0);
 		return;
 	}
@@ -218,15 +222,8 @@ int classifi(struct __sk_buff *skb)
 	__u64 old_count;
 	__u16 l3_offset = 0;
 
-	/*
-	 * Linearize packet data for GRO'd packets. GRO coalesces multiple
-	 * TCP segments into one skb with data split across frags. Without
-	 * this, skb->data only contains the first segment's worth of data.
-	 * Pull min(skb->len, MAX_PACKET_SAMPLE) since pull_data fails if
-	 * we request more than available.
-	 */
-	__u32 pull_len = skb->len < MAX_PACKET_SAMPLE ? skb->len : MAX_PACKET_SAMPLE;
-	if (bpf_skb_pull_data(skb, pull_len) < 0)
+	/* Headers only; larger pulls collapse FRAGLIST-GRO chains downstream. */
+	if (bpf_skb_pull_data(skb, 128) < 0)
 		return TC_ACT_OK;
 
 	if (parse_flow_key(skb, &key, &l3_offset) < 0)
