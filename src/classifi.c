@@ -549,6 +549,7 @@ void emit_dns_event(struct classifi_ctx *ctx, const char *client_ip, const char 
 	blob_buf_free(&b);
 }
 
+/* Values match the on-wire TCP flags */
 #define TCP_F_FIN 0x01
 #define TCP_F_SYN 0x02
 #define TCP_F_RST 0x04
@@ -600,19 +601,6 @@ static const struct tcphdr *tcp_hdr_locate(const struct packet_sample *sample,
 		*ip_hdr_len_out = ip_hdr_len;
 
 	return (const struct tcphdr *)(ip_packet + ip_hdr_len);
-}
-
-static int get_tcp_flags(const struct packet_sample *sample, __u8 *flags)
-{
-	const struct tcphdr *tcph = tcp_hdr_locate(sample, NULL);
-
-	if (!tcph)
-		return -1;
-
-	*flags = (tcph->fin ? TCP_F_FIN : 0) | (tcph->syn ? TCP_F_SYN : 0) |
-		 (tcph->rst ? TCP_F_RST : 0) | (tcph->ack ? TCP_F_ACK : 0);
-
-	return 0;
 }
 
 static int get_tcp_payload(struct packet_sample *sample, char *buf, size_t buf_len)
@@ -1378,7 +1366,7 @@ static void flow_track_handshake(struct ndpi_flow *flow,
 				 const struct packet_sample *sample)
 {
 	__u64 ts = sample->ts_ns;
-	__u8 flags;
+	__u8 flags = sample->tcp_flags;
 	int is_syn, is_synack, is_ack;
 
 	if (packet_view->protocol != IPPROTO_TCP)
@@ -1386,8 +1374,6 @@ static void flow_track_handshake(struct ndpi_flow *flow,
 	if (flow->handshake_complete)
 		return;
 	if (!ts)
-		return;
-	if (get_tcp_flags(sample, &flags) < 0)
 		return;
 
 	is_syn = (flags & TCP_F_SYN) && !(flags & TCP_F_ACK);

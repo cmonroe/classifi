@@ -69,7 +69,10 @@ struct packet_sample {
 	__u32 ifindex;
 	__u16 l3_offset;
 	__u8 direction;
-	__u8 pad;
+	/* Raw on-wire TCP flags octet (TCP header byte 13: FIN/SYN/RST/PSH/
+	 * ACK/URG/ECE/CWR); 0 for non-TCP. Exposed here so userspace reads
+	 * handshake flags without re-parsing the captured packet bytes. */
+	__u8 tcp_flags;
 	__u8 data[MAX_PACKET_SAMPLE];
 } __attribute__((packed));
 

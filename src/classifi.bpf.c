@@ -57,7 +57,8 @@ struct {
 
 static __always_inline int parse_flow_key(struct __sk_buff *skb,
                                           struct flow_key *key,
-                                          __u16 *l3_offset)
+                                          __u16 *l3_offset,
+                                          __u8 *tcp_flags)
 {
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
@@ -117,6 +118,8 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 
 			key->src_port = bpf_ntohs(tcph->source);
 			key->dst_port = bpf_ntohs(tcph->dest);
+			/* Flags octet at byte 13, within the just-validated header. */
+			*tcp_flags = ((const __u8 *)tcph)[13];
 		} else if (iph->protocol == IPPROTO_UDP) {
 			struct udphdr *udph = data + offset;
 
@@ -154,6 +157,8 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 
 			key->src_port = bpf_ntohs(tcph->source);
 			key->dst_port = bpf_ntohs(tcph->dest);
+			/* Flags octet at byte 13, within the just-validated header. */
+			*tcp_flags = ((const __u8 *)tcph)[13];
 		} else if (ip6h->nexthdr == IPPROTO_UDP) {
 			struct udphdr *udph = data + offset;
 
@@ -174,7 +179,8 @@ static __always_inline void sample_packet(struct __sk_buff *skb,
                                           struct flow_key *key,
                                           __u8 direction,
                                           __u64 ts_ns,
-                                          __u16 l3_offset)
+                                          __u16 l3_offset,
+                                          __u8 tcp_flags)
 {
 	struct packet_sample *sample;
 	__u32 len;
@@ -206,7 +212,7 @@ static __always_inline void sample_packet(struct __sk_buff *skb,
 	sample->ifindex = skb->ifindex;
 	sample->l3_offset = l3_offset;
 	sample->direction = direction;
-	sample->pad = 0;
+	sample->tcp_flags = tcp_flags;
 	sample->data_len = len;
 
 	bpf_ringbuf_submit(sample, 0);
@@ -221,6 +227,7 @@ int classifi(struct __sk_buff *skb)
 	__u8 direction;
 	__u64 old_count;
 	__u16 l3_offset = 0;
+	__u8 tcp_flags = 0;
 
 	/*
 	 * Headers only; larger pulls collapse FRAGLIST-GRO chains downstream.
@@ -232,7 +239,7 @@ int classifi(struct __sk_buff *skb)
 	if (bpf_skb_pull_data(skb, pull_len) < 0)
 		return TC_ACT_OK;
 
-	if (parse_flow_key(skb, &key, &l3_offset) < 0)
+	if (parse_flow_key(skb, &key, &l3_offset, &tcp_flags) < 0)
 		return TC_ACT_OK;
 
 	direction = canonicalize_flow_key(&key);
@@ -252,14 +259,14 @@ int classifi(struct __sk_buff *skb)
 				__sync_fetch_and_add(count, 1);
 			return TC_ACT_OK;
 		}
-		sample_packet(skb, &key, direction, now, l3_offset);
+		sample_packet(skb, &key, direction, now, l3_offset, tcp_flags);
 	} else {
 		old_count = __sync_fetch_and_add(&info->packets, 1);
 		__sync_fetch_and_add(&info->bytes, skb->len);
 		info->last_seen = now;
 
 		if (info->state == FLOW_STATE_NEW && old_count < PACKETS_TO_SAMPLE) {
-			sample_packet(skb, &key, direction, now, l3_offset);
+			sample_packet(skb, &key, direction, now, l3_offset, tcp_flags);
 
 			if (old_count + 1 >= PACKETS_TO_SAMPLE)
 				info->state = FLOW_STATE_SAMPLED;
