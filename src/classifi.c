@@ -408,6 +408,28 @@ void geoip_flow_resolve(struct classifi_ctx *ctx, struct ndpi_flow *flow)
 	ndpi_get_geoip_aso(ctx->ndpi, ip_str, flow->dst_aso, sizeof(flow->dst_aso));
 }
 
+void network_quality_to_blob(struct blob_buf *b, const struct ndpi_flow *flow)
+{
+	void *nq;
+
+	if (!flow->handshake_rtt_us && !flow->client_rtt_us && !flow->setup_us &&
+	    !flow->syn_retransmits && !flow->synack_retransmits)
+		return;
+
+	nq = blobmsg_open_table(b, "network_quality");
+	if (flow->handshake_rtt_us)
+		blobmsg_add_u32(b, "handshake_rtt_us", flow->handshake_rtt_us);
+	if (flow->client_rtt_us)
+		blobmsg_add_u32(b, "client_rtt_us", flow->client_rtt_us);
+	if (flow->setup_us)
+		blobmsg_add_u32(b, "setup_us", flow->setup_us);
+	if (flow->syn_retransmits)
+		blobmsg_add_u32(b, "syn_retransmits", flow->syn_retransmits);
+	if (flow->synack_retransmits)
+		blobmsg_add_u32(b, "synack_retransmits", flow->synack_retransmits);
+	blobmsg_close_table(b, nq);
+}
+
 void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow, const char *ifname)
 {
 	struct blob_buf b = {};
@@ -493,6 +515,8 @@ void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			blobmsg_add_string(&b, "stream_content", stream_content);
 	}
 
+	network_quality_to_blob(&b, flow);
+
 	if (ubus_send_event(ctx->ubus_ctx, "classifi.classified", b.head) != 0) {
 		if (ctx->verbose)
 			fprintf(stderr, "failed to send ubus event for flow %s:%u -> %s:%u\n",
@@ -525,58 +549,88 @@ void emit_dns_event(struct classifi_ctx *ctx, const char *client_ip, const char 
 	blob_buf_free(&b);
 }
 
-static int get_tcp_payload(struct packet_sample *sample, char *buf, size_t buf_len)
+#define TCP_F_FIN 0x01
+#define TCP_F_SYN 0x02
+#define TCP_F_RST 0x04
+#define TCP_F_ACK 0x10
+
+/*
+ * Validate that the sample holds a complete IPv4/IPv6 TCP header and return a
+ * pointer to it (NULL otherwise). When non-NULL, ip_hdr_len_out receives the L3
+ * header length so callers can locate the TCP payload without re-walking.
+ */
+static const struct tcphdr *tcp_hdr_locate(const struct packet_sample *sample,
+					   unsigned int *ip_hdr_len_out)
 {
-	unsigned char *ip_packet;
-	unsigned int ip_hdr_len, tcp_hdr_len;
-	unsigned char *tcp_hdr;
-	unsigned char *payload;
-	unsigned int payload_len;
 	unsigned int l3_offset = sample->l3_offset;
+	const unsigned char *ip_packet;
+	unsigned int ip_hdr_len;
 
 	if (l3_offset >= sample->data_len)
-		return -1;
+		return NULL;
 
 	ip_packet = sample->data + l3_offset;
 
 	if (sample->key.family == FLOW_FAMILY_IPV4) {
-		struct iphdr *iph = (struct iphdr *)ip_packet;
+		const struct iphdr *iph = (const struct iphdr *)ip_packet;
 
 		if (l3_offset + sizeof(struct iphdr) > sample->data_len)
-			return -1;
+			return NULL;
 		if (iph->protocol != IPPROTO_TCP)
-			return -1;
+			return NULL;
 
 		ip_hdr_len = iph->ihl * 4;
-		if (l3_offset + ip_hdr_len > sample->data_len)
-			return -1;
-
-		tcp_hdr = ip_packet + ip_hdr_len;
 	} else if (sample->key.family == FLOW_FAMILY_IPV6) {
-		struct ipv6hdr *ip6h = (struct ipv6hdr *)ip_packet;
+		const struct ipv6hdr *ip6h = (const struct ipv6hdr *)ip_packet;
 
 		if (l3_offset + sizeof(struct ipv6hdr) > sample->data_len)
-			return -1;
+			return NULL;
 		if (ip6h->nexthdr != IPPROTO_TCP)
-			return -1;
+			return NULL;
 
 		ip_hdr_len = sizeof(struct ipv6hdr);
-		tcp_hdr = ip_packet + ip_hdr_len;
 	} else {
-		return -1;
+		return NULL;
 	}
 
 	if (l3_offset + ip_hdr_len + sizeof(struct tcphdr) > sample->data_len)
+		return NULL;
+
+	if (ip_hdr_len_out)
+		*ip_hdr_len_out = ip_hdr_len;
+
+	return (const struct tcphdr *)(ip_packet + ip_hdr_len);
+}
+
+static int get_tcp_flags(const struct packet_sample *sample, __u8 *flags)
+{
+	const struct tcphdr *tcph = tcp_hdr_locate(sample, NULL);
+
+	if (!tcph)
 		return -1;
 
-	struct tcphdr *tcph = (struct tcphdr *)tcp_hdr;
+	*flags = (tcph->fin ? TCP_F_FIN : 0) | (tcph->syn ? TCP_F_SYN : 0) |
+		 (tcph->rst ? TCP_F_RST : 0) | (tcph->ack ? TCP_F_ACK : 0);
+
+	return 0;
+}
+
+static int get_tcp_payload(struct packet_sample *sample, char *buf, size_t buf_len)
+{
+	unsigned int ip_hdr_len, tcp_hdr_len, payload_len;
+	const unsigned char *payload;
+	const struct tcphdr *tcph;
+
+	tcph = tcp_hdr_locate(sample, &ip_hdr_len);
+	if (!tcph)
+		return -1;
+
 	tcp_hdr_len = tcph->doff * 4;
-
-	if (l3_offset + ip_hdr_len + tcp_hdr_len > sample->data_len)
+	if (sample->l3_offset + ip_hdr_len + tcp_hdr_len > sample->data_len)
 		return -1;
 
-	payload = tcp_hdr + tcp_hdr_len;
-	payload_len = sample->data_len - l3_offset - ip_hdr_len - tcp_hdr_len;
+	payload = (const unsigned char *)tcph + tcp_hdr_len;
+	payload_len = sample->data_len - sample->l3_offset - ip_hdr_len - tcp_hdr_len;
 
 	if (payload_len == 0)
 		return -1;
@@ -1312,6 +1366,71 @@ static void log_ndpi_direction_debug(struct ndpi_flow *flow, const struct flow_k
 	}
 }
 
+/*
+ * Stamp TCP 3-way handshake timestamps from per-packet kernel time and derive
+ * RTTs. Measured at the LAN bridge: SYN->SYN-ACK is the device->server (WAN)
+ * round trip, SYN-ACK->ACK is the device->client (LAN) round trip. Handshake
+ * packets identified by TCP flags (sample->direction is only a canonical-order
+ * label, not client/server).
+ */
+static void flow_track_handshake(struct ndpi_flow *flow,
+				 const struct flow_key *packet_view,
+				 const struct packet_sample *sample)
+{
+	__u64 ts = sample->ts_ns;
+	__u8 flags;
+	int is_syn, is_synack, is_ack;
+
+	if (packet_view->protocol != IPPROTO_TCP)
+		return;
+	if (flow->handshake_complete)
+		return;
+	if (!ts)
+		return;
+	if (get_tcp_flags(sample, &flags) < 0)
+		return;
+
+	is_syn = (flags & TCP_F_SYN) && !(flags & TCP_F_ACK);
+	is_synack = (flags & (TCP_F_SYN | TCP_F_ACK)) == (TCP_F_SYN | TCP_F_ACK);
+	is_ack = (flags & TCP_F_ACK) && !(flags & (TCP_F_SYN | TCP_F_RST | TCP_F_FIN));
+
+	if (is_syn) {
+		if (!flow->saw_syn) {
+			flow->syn_ts_ns = ts;
+			flow->saw_syn = 1;
+		} else if (!flow->saw_synack && flow->syn_retransmits < 0xFF) {
+			/* Duplicate SYN before any SYN-ACK is WAN-side loss; reset the
+			 * baseline so RTT reflects the attempt that gets answered rather
+			 * than being inflated by the retransmit timeout. */
+			flow->syn_ts_ns = ts;
+			flow->syn_retransmits++;
+		}
+		return;
+	}
+
+	if (is_synack) {
+		if (!flow->saw_syn)
+			return;
+		if (!flow->saw_synack) {
+			flow->synack_ts_ns = ts;
+			flow->saw_synack = 1;
+			if (ts > flow->syn_ts_ns)
+				flow->handshake_rtt_us = (__u32)((ts - flow->syn_ts_ns) / 1000ULL);
+		} else if (flow->synack_retransmits < 0xFF) {
+			flow->synack_retransmits++;
+		}
+		return;
+	}
+
+	if (is_ack && flow->saw_synack) {
+		if (ts > flow->synack_ts_ns)
+			flow->client_rtt_us = (__u32)((ts - flow->synack_ts_ns) / 1000ULL);
+		if (flow->saw_syn && ts > flow->syn_ts_ns)
+			flow->setup_us = (__u32)((ts - flow->syn_ts_ns) / 1000ULL);
+		flow->handshake_complete = 1;
+	}
+}
+
 static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *sample)
 {
 	struct ndpi_flow *flow;
@@ -1331,6 +1450,8 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		return;
 
 	flow_key_to_strings(&packet_view, src_ip, sizeof(src_ip), dst_ip, sizeof(dst_ip));
+
+	flow_track_handshake(flow, &packet_view, sample);
 
 	check_rules_and_execute(ctx, flow, &packet_view, sample,
 				interface_name_by_index(ctx, sample->ifindex));

@@ -26,6 +26,7 @@
 #include "classifi_bpf.h"
 
 struct dump_writer;
+struct blob_buf;
 
 struct ja4_entry {
 	struct avl_node node;
@@ -128,6 +129,18 @@ struct ndpi_flow {
 
 	u_int8_t multimedia_types;
 
+	/* network-quality metrics; *_ts_ns are internal scratch (kernel monotonic ns) */
+	__u64 syn_ts_ns;            /* first SYN (no ACK) */
+	__u64 synack_ts_ns;         /* first SYN+ACK */
+	__u32 handshake_rtt_us;     /* synack - syn: device->server (WAN) RTT */
+	__u32 client_rtt_us;        /* ack - synack: device->client (LAN) RTT */
+	__u32 setup_us;             /* ack - syn: device-observed 3-way setup */
+	__u8 saw_syn;
+	__u8 saw_synack;
+	__u8 handshake_complete;
+	__u8 syn_retransmits;       /* saturating */
+	__u8 synack_retransmits;    /* saturating */
+
 	struct ndpi_flow_input_info input_info;
 
 	struct ndpi_flow *next;
@@ -194,6 +207,7 @@ struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *k
 struct ndpi_flow *flow_get_or_create(struct classifi_ctx *ctx, struct flow_key *key,
 				     const struct flow_key *packet_view, __u8 direction);
 int tls_quic_metadata_ready(struct ndpi_flow *flow);
+void network_quality_to_blob(struct blob_buf *b, const struct ndpi_flow *flow);
 void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			       const char *ifname);
 void emit_dns_event(struct classifi_ctx *ctx, const char *client_ip,

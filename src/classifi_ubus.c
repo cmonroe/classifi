@@ -456,6 +456,8 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 			blobmsg_add_string(b, "stream_content", stream_content);
 	}
 
+	network_quality_to_blob(b, flow);
+
 	blobmsg_close_table(b, flow_obj);
 	fbc->count++;
 }
