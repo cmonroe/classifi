@@ -222,8 +222,14 @@ int classifi(struct __sk_buff *skb)
 	__u64 old_count;
 	__u16 l3_offset = 0;
 
-	/* Headers only; larger pulls collapse FRAGLIST-GRO chains downstream. */
-	if (bpf_skb_pull_data(skb, 128) < 0)
+	/*
+	 * Headers only; larger pulls collapse FRAGLIST-GRO chains downstream.
+	 * Clamp to skb->len: bpf_skb_pull_data() fails when asked for more bytes
+	 * than the packet holds, which would drop every sub-128B packet (TCP
+	 * SYN/SYN-ACK/ACK, small DNS queries) before it can be tracked/sampled.
+	 */
+	__u32 pull_len = skb->len < 128 ? skb->len : 128;
+	if (bpf_skb_pull_data(skb, pull_len) < 0)
 		return TC_ACT_OK;
 
 	if (parse_flow_key(skb, &key, &l3_offset) < 0)
