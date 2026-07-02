@@ -350,9 +350,14 @@ reload_config(struct classifi_ctx *ctx, int *out_added, int *out_removed)
 	return 0;
 }
 
+/* ubusd rejects messages above UBUS_MAX_MSGLEN (1MB); a full flow table
+ * serializes well past that, so bound the reply and flag the cut. */
+#define GET_FLOWS_MAX 1024
+
 struct flow_blob_ctx {
 	struct blob_buf *b;
 	int count;
+	int truncated;
 };
 
 static void
@@ -360,6 +365,11 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 {
 	struct flow_blob_ctx *fbc = user_data;
 	struct blob_buf *b = fbc->b;
+
+	if (fbc->count >= GET_FLOWS_MAX) {
+		fbc->truncated = 1;
+		return;
+	}
 	void *flow_obj, *stack_array;
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
 	const char *master_name, *app_name, *category_name;
@@ -590,6 +600,8 @@ classifi_get_flows_handler(struct ubus_context *uctx, struct ubus_object *obj,
 	flow_table_iterate(g_ctx, flow_to_blob, &fbc);
 	blobmsg_close_array(&b, flows_array);
 	blobmsg_add_u32(&b, "count", fbc.count);
+	if (fbc.truncated)
+		blobmsg_add_u8(&b, "truncated", 1);
 
 	ubus_send_reply(uctx, req, b.head);
 	blob_buf_free(&b);
