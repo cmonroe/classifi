@@ -1761,6 +1761,8 @@ int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,
 	ret = bpf_tc_attach(&hook, &opts_ingress);
 	if (ret) {
 		fprintf(stderr, "failed to attach TC program to %s ingress: %s\n", ifname, strerror(-ret));
+		hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
+		bpf_tc_hook_destroy(&hook);
 		return ret;
 	}
 
