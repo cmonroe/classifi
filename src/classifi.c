@@ -786,33 +786,30 @@ static int ip_addr_match(struct flow_addr *a, struct flow_addr *b, __u8 family)
 
 static int host_header_match(const char *payload, const char *expected_host)
 {
-	const char *host_start;
-	const char *line_end;
-	size_t host_len;
+	size_t host_len = strlen(expected_host);
+	const char *line = payload;
 
-	host_start = strstr(payload, "Host: ");
-	if (!host_start)
-		host_start = strstr(payload, "host: ");
-	if (!host_start)
-		return 0;
+	while (line && *line) {
+		if (strncasecmp(line, "Host:", 5) == 0) {
+			const char *value = line + 5;
 
-	host_start += 6;
+			while (*value == ' ' || *value == '\t')
+				value++;
 
-	line_end = strpbrk(host_start, "\r\n");
-	if (!line_end)
-		line_end = host_start + strlen(host_start);
+			/* expected_host contains no CR/LF, so an equal prefix
+			 * plus one of these terminators cannot cross the line */
+			if (strncasecmp(value, expected_host, host_len) == 0 &&
+			    (value[host_len] == ':' || value[host_len] == '\r' ||
+			     value[host_len] == '\n' || value[host_len] == '\0'))
+				return 1;
 
-	host_len = strlen(expected_host);
+			return 0;
+		}
 
-	if ((size_t)(line_end - host_start) < host_len)
-		return 0;
-
-	if (strncasecmp(host_start, expected_host, host_len) != 0)
-		return 0;
-
-	if (host_start[host_len] == ':' || host_start[host_len] == '\r' ||
-	    host_start[host_len] == '\n' || host_start[host_len] == '\0')
-		return 1;
+		line = strchr(line, '\n');
+		if (line)
+			line++;
+	}
 
 	return 0;
 }
