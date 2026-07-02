@@ -2033,6 +2033,10 @@ int main(int argc, char **argv)
 	int prog_fd, samples_fd;
 	int err = 0;
 
+	ctx.bpf_prog_fd = -1;
+	ctx.flow_map_fd = -1;
+	ctx.ringbuf_stats_fd = -1;
+
 	signal(SIGCHLD, SIG_IGN);
 
 	if (parse_args(argc, argv, &opts) < 0)
@@ -2099,23 +2103,27 @@ int main(int argc, char **argv)
 	if (libbpf_get_error(ctx.bpf_obj)) {
 		fprintf(stderr, "failed to open BPF object: %s\n", opts.bpf_obj_path);
 		ctx.bpf_obj = NULL;
-		return 1;
+		err = 1;
+		goto cleanup;
 	}
 
 	if (bpf_object__load(ctx.bpf_obj)) {
 		fprintf(stderr, "failed to load BPF object\n");
+		err = 1;
 		goto cleanup;
 	}
 
 	prog = bpf_object__find_program_by_name(ctx.bpf_obj, "classifi");
 	if (!prog) {
 		fprintf(stderr, "failed to find classifi program\n");
+		err = 1;
 		goto cleanup;
 	}
 
 	prog_fd = bpf_program__fd(prog);
 	if (prog_fd < 0) {
 		fprintf(stderr, "failed to get program fd\n");
+		err = 1;
 		goto cleanup;
 	}
 
@@ -2125,6 +2133,7 @@ int main(int argc, char **argv)
 
 	if (ctx.flow_map_fd < 0 || samples_fd < 0 || ctx.ringbuf_stats_fd < 0) {
 		fprintf(stderr, "failed to find BPF maps\n");
+		err = 1;
 		goto cleanup;
 	}
 
@@ -2133,6 +2142,7 @@ int main(int argc, char **argv)
 	for (int i = 0; i < opts.num_ifaces; i++) {
 		if (attach_tc_program(&ctx, prog_fd, opts.iface_names[i], opts.discover_mode) < 0) {
 			fprintf(stderr, "failed to attach program to interface %s\n", opts.iface_names[i]);
+			err = 1;
 			goto cleanup;
 		}
 		get_interface_ip(&ctx.interfaces[ctx.num_interfaces - 1]);
@@ -2152,12 +2162,14 @@ int main(int argc, char **argv)
 	ctx.ringbuf = ring_buffer__new(samples_fd, handle_sample, &ctx, NULL);
 	if (!ctx.ringbuf) {
 		fprintf(stderr, "failed to create ring buffer\n");
+		err = 1;
 		goto cleanup;
 	}
 
 	int rb_epoll_fd = ring_buffer__epoll_fd(ctx.ringbuf);
 	if (rb_epoll_fd < 0) {
 		fprintf(stderr, "failed to get ring buffer epoll fd\n");
+		err = 1;
 		goto cleanup;
 	}
 

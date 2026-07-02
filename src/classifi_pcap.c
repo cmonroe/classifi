@@ -240,8 +240,6 @@ int run_pcap_mode(struct classifi_ctx *ctx, const char *ifname)
 		return -1;
 	}
 
-	ctx->flow_map_fd = -1;
-
 	uint64_t last_cleanup = monotonic_time_sec();
 	while (keep_running) {
 		int ret = pcap_dispatch(handle, 100, pcap_packet_handler, (unsigned char *)ctx);
@@ -336,7 +334,6 @@ int run_pcap_replay(struct classifi_ctx *ctx, const char *filename)
 	}
 
 	ctx->pcap_ifname = "replay";
-	ctx->flow_map_fd = -1;
 
 	while ((ret = pcap_dispatch(handle, 1000, pcap_packet_handler,
 				    (unsigned char *)ctx)) > 0)
