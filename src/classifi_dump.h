@@ -21,7 +21,8 @@ struct dump_writer;
 struct dump_writer *dump_open(const char *filename);
 int dump_add_interface(struct dump_writer *w, const char *name, int ifindex);
 int dump_write_packet(struct dump_writer *w, int ifindex,
-		      uint64_t ts_ns, const uint8_t *data, uint32_t len);
+		      uint64_t ts_ns, const uint8_t *data, uint32_t len,
+		      uint32_t orig_len);
 void dump_close(struct dump_writer *w);
 
 #endif /* CLASSIFI_DUMP_H */

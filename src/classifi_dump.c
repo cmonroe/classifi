@@ -217,7 +217,8 @@ int dump_add_interface(struct dump_writer *w, const char *name, int ifindex)
 }
 
 int dump_write_packet(struct dump_writer *w, int ifindex,
-		      uint64_t ts_ns, const uint8_t *data, uint32_t len)
+		      uint64_t ts_ns, const uint8_t *data, uint32_t len,
+		      uint32_t orig_len)
 {
 	uint32_t pcapng_id = 0;
 	uint64_t wall_ts;
@@ -259,7 +260,7 @@ int dump_write_packet(struct dump_writer *w, int ifindex,
 		return -1;
 	if (write_u32(w->fp, len) < 0)
 		return -1;
-	if (write_u32(w->fp, len) < 0)
+	if (write_u32(w->fp, orig_len > len ? orig_len : len) < 0)
 		return -1;
 
 	if (fwrite(data, 1, len, w->fp) != len)

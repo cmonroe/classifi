@@ -1655,7 +1655,8 @@ static int handle_sample(void *ctx, void *data, size_t len)
 
 	if (classifi_ctx->dump)
 		dump_write_packet(classifi_ctx->dump, sample->ifindex,
-				  sample->ts_ns, sample->data, sample->data_len);
+				  sample->ts_ns, sample->data, sample->data_len,
+				  sample->orig_len);
 
 	classify_packet(classifi_ctx, sample);
 	return 0;
@@ -1780,6 +1781,9 @@ int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,
 	}
 
 	printf("attached BPF program to %s ingress+egress (ifindex %d)\n", ifname, ifindex);
+
+	if (ctx->dump)
+		dump_add_interface(ctx->dump, ifname, ifindex);
 
 	ctx->interfaces[ctx->num_interfaces].name = ifname;
 	ctx->interfaces[ctx->num_interfaces].ifindex = ifindex;

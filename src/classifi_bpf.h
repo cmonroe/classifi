@@ -76,6 +76,7 @@ struct packet_sample {
 	struct flow_key key;
 	__u64 ts_ns;
 	__u32 data_len;
+	__u32 orig_len;         /* on-wire length before the sample clamp */
 	__u32 ifindex;
 	__u32 tcp_seq;          /* host order; 0 for non-TCP */
 	__u32 tcp_ack_seq;      /* host order; 0 for non-TCP */
