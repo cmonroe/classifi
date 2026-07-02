@@ -162,7 +162,8 @@ struct dump_writer *dump_open(const char *filename)
 	if (!w)
 		return NULL;
 
-	w->fp = fopen(filename, "wb");
+	/* "e" (O_CLOEXEC) keeps the dump fd out of forked rule scripts */
+	w->fp = fopen(filename, "wbe");
 	if (!w->fp) {
 		fprintf(stderr, "failed to open %s for writing: %s\n",
 			filename, strerror(errno));
