@@ -278,8 +278,6 @@ rules_load_from_uci(struct classifi_ctx *ctx)
 	return count;
 }
 
-int get_interface_ip(struct interface_info *iface);
-
 int
 reload_config(struct classifi_ctx *ctx, int *out_added, int *out_removed)
 {
@@ -329,7 +327,6 @@ reload_config(struct classifi_ctx *ctx, int *out_added, int *out_removed)
 		}
 
 		if (attach_tc_program(ctx, ctx->bpf_prog_fd, discovered[i], 1) == 0) {
-			get_interface_ip(&ctx->interfaces[ctx->num_interfaces - 1]);
 			printf("added interface %s\n", discovered[i]);
 			added++;
 		} else {

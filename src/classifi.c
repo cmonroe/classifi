@@ -315,7 +315,7 @@ static void setup_signals(void)
 	signal(SIGTERM, signal_handler);
 }
 
-int get_interface_ip(struct interface_info *iface)
+static int get_interface_ip(struct interface_info *iface)
 {
 	struct ifaddrs *ifaddr, *ifa;
 	int found = 0;
@@ -1814,6 +1814,7 @@ int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,
 	ctx->interfaces[ctx->num_interfaces].tc_priority_ingress = opts_ingress.priority;
 	ctx->interfaces[ctx->num_interfaces].tc_handle_egress = opts_egress.handle;
 	ctx->interfaces[ctx->num_interfaces].tc_priority_egress = opts_egress.priority;
+	get_interface_ip(&ctx->interfaces[ctx->num_interfaces]);
 	ctx->num_interfaces++;
 
 	return 0;
@@ -2300,7 +2301,6 @@ int main(int argc, char **argv)
 			err = 1;
 			goto cleanup;
 		}
-		get_interface_ip(&ctx.interfaces[ctx.num_interfaces - 1]);
 	}
 
 	if (opts.dump_filename) {
