@@ -55,6 +55,22 @@ struct {
 	__type(value, __u64);
 } ringbuf_stats SEC(".maps");
 
+/*
+ * Staging area for variable-size ring buffer records.
+ * bpf_ringbuf_reserve() only takes a compile-time constant size, so
+ * reserving in the ring directly costs the full 8KB+ per sample no matter
+ * how small the packet is, cutting the 1MB ring to ~120 in-flight samples.
+ * Building the record here and emitting it with bpf_ringbuf_output() costs
+ * one extra bounded copy but lets a typical packet mix fit an order of
+ * magnitude more samples before anything is dropped.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct packet_sample);
+} sample_scratch SEC(".maps");
+
 /* L4 metadata parse_flow_key() lifts out of the (already bounds-checked) L4
  * header so the sample carries it directly and userspace need not re-parse. */
 struct l4_meta {
@@ -211,6 +227,15 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 	return PARSE_ERR;
 }
 
+static __always_inline void sample_drop_count(void)
+{
+	__u32 stats_key = 0;
+	__u64 *count = bpf_map_lookup_elem(&ringbuf_stats, &stats_key);
+
+	if (count)
+		__sync_fetch_and_add(count, 1);
+}
+
 static __always_inline void sample_packet(struct __sk_buff *skb,
                                           struct flow_key *key,
                                           __u8 direction,
@@ -219,27 +244,19 @@ static __always_inline void sample_packet(struct __sk_buff *skb,
                                           const struct l4_meta *l4)
 {
 	struct packet_sample *sample;
-	__u32 len;
+	__u32 scratch_key = 0;
+	__u32 len, size;
 
-	sample = bpf_ringbuf_reserve(&packet_samples, sizeof(*sample), 0);
-	if (!sample) {
-		__u32 stats_key = 0;
-		__u64 *count = bpf_map_lookup_elem(&ringbuf_stats, &stats_key);
-		if (count)
-			__sync_fetch_and_add(count, 1);
+	sample = bpf_map_lookup_elem(&sample_scratch, &scratch_key);
+	if (!sample)
 		return;
-	}
 
 	len = skb->len;
 	if (len > MAX_PACKET_SAMPLE)
 		len = MAX_PACKET_SAMPLE;
 
 	if (len == 0 || bpf_skb_load_bytes(skb, 0, sample->data, len) < 0) {
-		__u32 stats_key = 0;
-		__u64 *count = bpf_map_lookup_elem(&ringbuf_stats, &stats_key);
-		if (count)
-			__sync_fetch_and_add(count, 1);
-		bpf_ringbuf_discard(sample, 0);
+		sample_drop_count();
 		return;
 	}
 
@@ -254,7 +271,12 @@ static __always_inline void sample_packet(struct __sk_buff *skb,
 	sample->tcp_payload_len = l4->tcp_payload_len;
 	sample->data_len = len;
 
-	bpf_ringbuf_submit(sample, 0);
+	size = offsetof(struct packet_sample, data) + len;
+	if (size > sizeof(*sample))
+		return;
+
+	if (bpf_ringbuf_output(&packet_samples, sample, size, 0) < 0)
+		sample_drop_count();
 }
 
 SEC("tc")
@@ -303,10 +325,7 @@ int classifi(struct __sk_buff *skb)
 		new_info.state = FLOW_STATE_NEW;
 
 		if (bpf_map_update_elem(&flow_map, &key, &new_info, BPF_ANY) < 0) {
-			__u32 stats_key = 0;
-			__u64 *count = bpf_map_lookup_elem(&ringbuf_stats, &stats_key);
-			if (count)
-				__sync_fetch_and_add(count, 1);
+			sample_drop_count();
 			return TC_ACT_OK;
 		}
 		sample_packet(skb, &key, direction, now, l3_offset, &l4);

@@ -1629,10 +1629,12 @@ static int handle_sample(void *ctx, void *data, size_t len)
 	struct classifi_ctx *classifi_ctx = ctx;
 	struct packet_sample *sample = data;
 
-	if (len < sizeof(*sample))
+	/* Records are variable size: header plus data_len bytes of packet */
+	if (len < offsetof(struct packet_sample, data))
 		return 0;
 
-	if (sample->data_len > MAX_PACKET_SAMPLE)
+	if (sample->data_len > MAX_PACKET_SAMPLE ||
+	    offsetof(struct packet_sample, data) + sample->data_len > len)
 		return 0;
 
 	if (sample->l3_offset > sample->data_len)
