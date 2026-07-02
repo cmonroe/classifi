@@ -64,6 +64,9 @@ struct l4_meta {
 	__u8 tcp_flags;         /* TCP header byte 13; 0 for non-TCP */
 };
 
+#define PARSE_ERR       -1      /* not a packet we track */
+#define PARSE_SHORT     -2      /* headers beyond linear data; pull and retry */
+
 static __always_inline int parse_flow_key(struct __sk_buff *skb,
                                           struct flow_key *key,
                                           __u16 *l3_offset,
@@ -77,7 +80,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 	int i;
 
 	if (data + offset > data_end)
-		return -1;
+		return PARSE_SHORT;
 
 	h_proto = eth->h_proto;
 
@@ -87,7 +90,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 			struct bpf_vlan_hdr *vh = data + offset;
 
 			if ((void *)vh + sizeof(*vh) > data_end)
-				return -1;
+				return PARSE_SHORT;
 
 			h_proto = vh->h_vlan_encapsulated_proto;
 			offset += sizeof(*vh);
@@ -99,13 +102,13 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 		__u32 ip_hdr_len;
 
 		if ((void *)iph + sizeof(*iph) > data_end)
-			return -1;
+			return PARSE_SHORT;
 
 		ip_hdr_len = iph->ihl * 4;
 		if (ip_hdr_len < sizeof(*iph))
-			return -1;
+			return PARSE_ERR;
 		if ((void *)iph + ip_hdr_len > data_end)
-			return -1;
+			return PARSE_SHORT;
 
 		key->family = FLOW_FAMILY_IPV4;
 		key->protocol = iph->protocol;
@@ -129,7 +132,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 			int payload;
 
 			if ((void *)tcph + sizeof(*tcph) > data_end)
-				return -1;
+				return PARSE_SHORT;
 
 			key->src_port = bpf_ntohs(tcph->source);
 			key->dst_port = bpf_ntohs(tcph->dest);
@@ -139,7 +142,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 			l4->tcp_ack_seq = bpf_ntohl(tcph->ack_seq);
 			tcp_hdr_len = tcph->doff * 4;
 			if (tcp_hdr_len < sizeof(*tcph))
-				return -1;
+				return PARSE_ERR;
 			payload = (int)bpf_ntohs(iph->tot_len) - (int)ip_hdr_len - (int)tcp_hdr_len;
 			l4->tcp_payload_len = payload < 0 ? 0 :
 					      (payload > 0xFFFF ? 0xFFFF : payload);
@@ -147,7 +150,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 			struct udphdr *udph = data + offset;
 
 			if ((void *)udph + sizeof(*udph) > data_end)
-				return -1;
+				return PARSE_SHORT;
 
 			key->src_port = bpf_ntohs(udph->source);
 			key->dst_port = bpf_ntohs(udph->dest);
@@ -160,7 +163,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 		struct ipv6hdr *ip6h = data + offset;
 
 		if ((void *)ip6h + sizeof(*ip6h) > data_end)
-			return -1;
+			return PARSE_SHORT;
 
 		key->family = FLOW_FAMILY_IPV6;
 		key->protocol = ip6h->nexthdr;
@@ -178,7 +181,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 			int payload;
 
 			if ((void *)tcph + sizeof(*tcph) > data_end)
-				return -1;
+				return PARSE_SHORT;
 
 			key->src_port = bpf_ntohs(tcph->source);
 			key->dst_port = bpf_ntohs(tcph->dest);
@@ -188,7 +191,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 			l4->tcp_ack_seq = bpf_ntohl(tcph->ack_seq);
 			tcp_hdr_len = tcph->doff * 4;
 			if (tcp_hdr_len < sizeof(*tcph))
-				return -1;
+				return PARSE_ERR;
 			payload = (int)bpf_ntohs(ip6h->payload_len) - (int)tcp_hdr_len;
 			l4->tcp_payload_len = payload < 0 ? 0 :
 					      (payload > 0xFFFF ? 0xFFFF : payload);
@@ -196,7 +199,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 			struct udphdr *udph = data + offset;
 
 			if ((void *)udph + sizeof(*udph) > data_end)
-				return -1;
+				return PARSE_SHORT;
 
 			key->src_port = bpf_ntohs(udph->source);
 			key->dst_port = bpf_ntohs(udph->dest);
@@ -205,7 +208,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 		return 0;
 	}
 
-	return -1;
+	return PARSE_ERR;
 }
 
 static __always_inline void sample_packet(struct __sk_buff *skb,
@@ -264,18 +267,28 @@ int classifi(struct __sk_buff *skb)
 	__u64 old_count;
 	__u16 l3_offset = 0;
 	struct l4_meta l4 = {};
+	int ret;
 
 	/*
+	 * Forwarded traffic normally has the headers in the linear area, so
+	 * parse directly and pull only on demand: bpf_skb_pull_data() forces
+	 * the skb writable, which unclones every cloned skb it touches.
 	 * Headers only; larger pulls collapse FRAGLIST-GRO chains downstream.
-	 * Clamp to skb->len: bpf_skb_pull_data() fails when asked for more bytes
-	 * than the packet holds, which would drop every sub-128B packet (TCP
-	 * SYN/SYN-ACK/ACK, small DNS queries) before it can be tracked/sampled.
+	 * Clamp to skb->len: bpf_skb_pull_data() fails when asked for more
+	 * bytes than the packet holds, which would drop every sub-128B packet
+	 * (TCP SYN/SYN-ACK/ACK, small DNS queries) before it can be
+	 * tracked/sampled.
 	 */
-	__u32 pull_len = skb->len < 128 ? skb->len : 128;
-	if (bpf_skb_pull_data(skb, pull_len) < 0)
-		return TC_ACT_OK;
+	ret = parse_flow_key(skb, &key, &l3_offset, &l4);
+	if (ret == PARSE_SHORT) {
+		__u32 pull_len = skb->len < 128 ? skb->len : 128;
 
-	if (parse_flow_key(skb, &key, &l3_offset, &l4) < 0)
+		if (bpf_skb_pull_data(skb, pull_len) < 0)
+			return TC_ACT_OK;
+
+		ret = parse_flow_key(skb, &key, &l3_offset, &l4);
+	}
+	if (ret < 0)
 		return TC_ACT_OK;
 
 	direction = canonicalize_flow_key(&key);
@@ -286,6 +299,7 @@ int classifi(struct __sk_buff *skb)
 		new_info.bytes = skb->len;
 		new_info.first_seen = now;
 		new_info.last_seen = now;
+		new_info.ifindex = skb->ifindex;
 		new_info.state = FLOW_STATE_NEW;
 
 		if (bpf_map_update_elem(&flow_map, &key, &new_info, BPF_ANY) < 0) {
@@ -296,17 +310,29 @@ int classifi(struct __sk_buff *skb)
 			return TC_ACT_OK;
 		}
 		sample_packet(skb, &key, direction, now, l3_offset, &l4);
-	} else {
-		old_count = __sync_fetch_and_add(&info->packets, 1);
-		__sync_fetch_and_add(&info->bytes, skb->len);
+
+		return TC_ACT_OK;
+	}
+
+	if (info->ifindex != skb->ifindex)
+		return TC_ACT_OK;
+
+	/* Refresh idle tracking without dirtying the cacheline per packet;
+	 * userspace expiry works on FLOW_IDLE_TIMEOUT granularity. */
+	if (now - info->last_seen > 1000000000ULL)
 		info->last_seen = now;
 
-		if (info->state == FLOW_STATE_NEW && old_count < PACKETS_TO_SAMPLE) {
-			sample_packet(skb, &key, direction, now, l3_offset, &l4);
+	if (info->state != FLOW_STATE_NEW)
+		return TC_ACT_OK;
 
-			if (old_count + 1 >= PACKETS_TO_SAMPLE)
-				info->state = FLOW_STATE_SAMPLED;
-		}
+	old_count = __sync_fetch_and_add(&info->packets, 1);
+	__sync_fetch_and_add(&info->bytes, skb->len);
+
+	if (old_count < PACKETS_TO_SAMPLE) {
+		sample_packet(skb, &key, direction, now, l3_offset, &l4);
+
+		if (old_count + 1 >= PACKETS_TO_SAMPLE)
+			info->state = FLOW_STATE_SAMPLED;
 	}
 
 	return TC_ACT_OK;

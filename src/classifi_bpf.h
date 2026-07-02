@@ -62,8 +62,14 @@ struct flow_info {
 	__u64 bytes;
 	__u64 first_seen;
 	__u64 last_seen;
+	/* Interface that created the flow. Traffic routed between two monitored
+	 * interfaces hits the hook once per interface; only the owner tracks it,
+	 * otherwise every packet is double counted, duplicate samples reach nDPI
+	 * and same-ISN duplicate SYNs read as retransmits, which suppresses the
+	 * handshake RTT metrics. */
+	__u32 ifindex;
 	__u8 state;
-	__u8 pad[7];
+	__u8 pad[3];
 };
 
 struct packet_sample {
