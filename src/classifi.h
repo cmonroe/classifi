@@ -76,8 +76,16 @@ static inline uint64_t monotonic_time_sec(void)
 	return (uint64_t)ts.tv_sec;
 }
 
-#define FLOW_TABLE_SIZE 1024
+#define FLOW_TABLE_SIZE 4096
 #define MAX_INTERFACES 8
+
+/*
+ * The kernel LRU map keeps evicting old entries under a flow flood, so new
+ * flows keep getting sampled and each one costs a userspace ndpi_flow plus
+ * an nDPI flow struct (~2KB) that only the 30s cleanup timer reclaims. Cap
+ * the userspace table so a port scan cannot run the daemon out of memory.
+ */
+#define MAX_USERSPACE_FLOWS (MAX_FLOWS * 2)
 
 struct interface_info {
 	const char *name;
@@ -178,6 +186,7 @@ struct classifi_ctx {
 	int ja4_entries;
 
 	struct ndpi_flow *flow_table[FLOW_TABLE_SIZE];
+	int num_flows;
 
 	struct interface_info interfaces[MAX_INTERFACES];
 	int num_interfaces;

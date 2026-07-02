@@ -84,6 +84,7 @@ static void cleanup_flow_table(struct classifi_ctx *ctx)
 		}
 		ctx->flow_table[i] = NULL;
 	}
+	ctx->num_flows = 0;
 }
 
 #define FNV_OFFSET 2166136261u
@@ -225,8 +226,17 @@ void flow_addr_to_string(const struct flow_addr *addr, __u8 family,
 struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *key)
 {
 	unsigned int hash = flow_hash(key);
-	struct ndpi_flow *flow = calloc(1, sizeof(*flow));
+	struct ndpi_flow *flow;
+	static uint64_t flows_dropped;
 
+	if (ctx->num_flows >= MAX_USERSPACE_FLOWS) {
+		if ((++flows_dropped % 10000) == 1)
+			fprintf(stderr, "flow table full (%d flows), %llu creations dropped\n",
+				ctx->num_flows, (unsigned long long)flows_dropped);
+		return NULL;
+	}
+
+	flow = calloc(1, sizeof(*flow));
 	if (!flow)
 		return NULL;
 
@@ -245,6 +255,7 @@ struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *k
 
 	flow->next = ctx->flow_table[hash];
 	ctx->flow_table[hash] = flow;
+	ctx->num_flows++;
 
 	return flow;
 }
@@ -259,11 +270,13 @@ struct ndpi_flow *flow_get_or_create(struct classifi_ctx *ctx, struct flow_key *
 	if (!flow) {
 		flow = flow_table_insert(ctx, key);
 		if (!flow) {
-			flow_key_to_strings(packet_view, src_ip, sizeof(src_ip),
-					    dst_ip, sizeof(dst_ip));
-			fprintf(stderr, "failed to create flow for %s:%u -> %s:%u\n",
-				src_ip, packet_view->src_port,
-				dst_ip, packet_view->dst_port);
+			if (ctx->verbose) {
+				flow_key_to_strings(packet_view, src_ip, sizeof(src_ip),
+						    dst_ip, sizeof(dst_ip));
+				fprintf(stderr, "failed to create flow for %s:%u -> %s:%u\n",
+					src_ip, packet_view->src_port,
+					dst_ip, packet_view->dst_port);
+			}
 			return NULL;
 		}
 		if (ctx->verbose) {
@@ -1821,6 +1834,7 @@ static void flow_free(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 	if (flow->flow)
 		ndpi_flow_free(flow->flow);
 	free(flow);
+	ctx->num_flows--;
 }
 
 static const char *flow_event_ifname(struct classifi_ctx *ctx, struct ndpi_flow *flow)
