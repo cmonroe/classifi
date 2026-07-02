@@ -2182,16 +2182,8 @@ int main(int argc, char **argv)
 	setup_signals();
 
 	uloop_init();
-	ctx.ubus_ctx = ubus_connect(NULL);
-	if (!ctx.ubus_ctx) {
-		fprintf(stderr, "warning: failed to connect to ubus, events will not be emitted\n");
-	} else {
-		ubus_add_uloop(ctx.ubus_ctx);
-		if (classifi_ubus_init(&ctx) != 0)
-			fprintf(stderr, "warning: failed to initialize classifi ubus\n");
-		if (ctx.verbose)
-			fprintf(stderr, "connected to ubus for event emission\n");
-	}
+	if (classifi_ubus_init(&ctx) != 0)
+		fprintf(stderr, "warning: failed to initialize classifi ubus\n");
 
 	ctx.ndpi = setup_ndpi();
 	if (!ctx.ndpi) {
@@ -2346,10 +2338,7 @@ cleanup:
 	if (ctx.ndpi)
 		ndpi_exit_detection_module(ctx.ndpi);
 
-	if (ctx.ubus_ctx) {
-		ubus_free(ctx.ubus_ctx);
-		ctx.ubus_ctx = NULL;
-	}
+	classifi_ubus_done(&ctx);
 	uloop_done();
 
 	return err != 0;

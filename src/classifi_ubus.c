@@ -613,21 +613,39 @@ static struct ubus_object classifi_obj = {
 	.n_methods = ARRAY_SIZE(classifi_methods),
 };
 
+static struct ubus_auto_conn ubus_conn;
+
+/* Runs on every (re)connect: ubusd restarts must not take the daemon down
+ * (the default connection_lost handler ends uloop), so the connection is
+ * managed by ubus_auto_conn and the object re-registered each time. */
+static void
+classifi_ubus_connected(struct ubus_context *uctx)
+{
+	g_ctx->ubus_ctx = uctx;
+
+	if (ubus_add_object(uctx, &classifi_obj) != 0)
+		fprintf(stderr, "failed to add classifi ubus object\n");
+	else if (g_ctx->verbose)
+		fprintf(stderr, "registered classifi ubus object\n");
+}
+
 int
 classifi_ubus_init(struct classifi_ctx *ctx)
 {
-	if (!ctx || !ctx->ubus_ctx)
+	if (!ctx)
 		return -1;
 
 	g_ctx = ctx;
 
-	if (ubus_add_object(ctx->ubus_ctx, &classifi_obj) != 0) {
-		fprintf(stderr, "failed to add classifi ubus object\n");
-		return -1;
-	}
-
-	if (ctx->verbose)
-		fprintf(stderr, "registered classifi ubus object\n");
+	ubus_conn.cb = classifi_ubus_connected;
+	ubus_auto_connect(&ubus_conn);
 
 	return 0;
+}
+
+void
+classifi_ubus_done(struct classifi_ctx *ctx)
+{
+	ubus_auto_shutdown(&ubus_conn);
+	ctx->ubus_ctx = NULL;
 }
