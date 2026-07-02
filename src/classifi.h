@@ -252,8 +252,7 @@ void flow_get_protocol_names(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 void flow_check_dns_query(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			  const struct flow_key *packet_view,
 			  const unsigned char *l3_data, unsigned int l3_len,
-			  const char *src_ip, const char *ifname,
-			  ndpi_protocol *protocol);
+			  const char *ifname, ndpi_protocol *protocol);
 int flow_check_detection_finalized(struct ndpi_flow *flow, ndpi_protocol *protocol);
 void flow_detection_giveup(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			   ndpi_protocol *protocol, int packets_threshold);
@@ -263,7 +262,7 @@ void flow_process_ndpi_result(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			      ndpi_protocol *protocol,
 			      const struct flow_key *packet_view,
 			      const unsigned char *l3_data, unsigned int l3_len,
-			      const char *src_ip, const char *ifname);
+			      const char *ifname);
 
 struct interface_info *interface_by_name(struct classifi_ctx *ctx, const char *name);
 int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,

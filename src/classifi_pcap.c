@@ -189,9 +189,8 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 	if (!flow)
 		return;
 
-	flow_key_to_strings(&packet_view, src_ip, sizeof(src_ip), dst_ip, sizeof(dst_ip));
-
 	if (ctx->verbose && (flow->packets_processed <= PACKETS_TO_SAMPLE || flow->packets_processed % 20 == 0)) {
+		flow_key_to_strings(&packet_view, src_ip, sizeof(src_ip), dst_ip, sizeof(dst_ip));
 		fprintf(stderr, "packet %llu (flow pkt %d, dir=%u): %s:%u -> %s:%u proto=%u len=%u [dir0=%d dir1=%d]\n",
 			total_packets, flow->packets_processed, direction,
 			src_ip, packet_view.src_port,
@@ -227,7 +226,7 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 		time_ms, &flow->input_info);
 
 	flow_process_ndpi_result(ctx, flow, &protocol, &packet_view, l3_data, l3_len,
-				 src_ip, ctx->pcap_ifname);
+				 ctx->pcap_ifname);
 }
 
 int run_pcap_mode(struct classifi_ctx *ctx, const char *ifname)

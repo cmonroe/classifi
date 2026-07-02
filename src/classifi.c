@@ -964,12 +964,12 @@ void flow_get_protocol_names(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 void flow_check_dns_query(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			  const struct flow_key *packet_view,
 			  const unsigned char *l3_data, unsigned int l3_len,
-			  const char *src_ip, const char *ifname,
-			  ndpi_protocol *protocol)
+			  const char *ifname, ndpi_protocol *protocol)
 {
 	const unsigned char *dns_payload;
 	unsigned int dns_len;
 	char query_name[256];
+	char client_ip[INET6_ADDRSTRLEN];
 	uint16_t qtype = 0;
 
 	if (protocol->proto.app_protocol != NDPI_PROTOCOL_DNS &&
@@ -994,9 +994,11 @@ void flow_check_dns_query(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 	if (extract_dns_query_name(dns_payload, dns_len, query_name, sizeof(query_name), &qtype) != 0)
 		return;
 
-	emit_dns_event(ctx, src_ip, query_name, qtype, ifname);
+	flow_addr_to_string(&packet_view->src, packet_view->family,
+			    client_ip, sizeof(client_ip));
+	emit_dns_event(ctx, client_ip, query_name, qtype, ifname);
 	if (ctx->verbose)
-		fprintf(stderr, "  [DNS] Query: %s from %s\n", query_name, src_ip);
+		fprintf(stderr, "  [DNS] Query: %s from %s\n", query_name, client_ip);
 }
 
 int flow_check_detection_finalized(struct ndpi_flow *flow, ndpi_protocol *protocol)
@@ -1119,19 +1121,19 @@ void flow_process_ndpi_result(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			      ndpi_protocol *protocol,
 			      const struct flow_key *packet_view,
 			      const unsigned char *l3_data, unsigned int l3_len,
-			      const char *src_ip, const char *ifname)
+			      const char *ifname)
 {
 	flow_update_metadata(ctx, flow, protocol);
 
 	if (ctx->verbose && (flow->packets_processed <= PACKETS_TO_SAMPLE ||
 			     flow->packets_processed % 20 == 0)) {
-		char dst_ip[INET6_ADDRSTRLEN];
-		flow_addr_to_string(&packet_view->dst, packet_view->family,
+		char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
+		flow_key_to_strings(packet_view, src_ip, sizeof(src_ip),
 				    dst_ip, sizeof(dst_ip));
 		flow_log_verbose_ndpi(ctx, flow, protocol, src_ip, dst_ip);
 	}
 
-	flow_check_dns_query(ctx, flow, packet_view, l3_data, l3_len, src_ip, ifname, protocol);
+	flow_check_dns_query(ctx, flow, packet_view, l3_data, l3_len, ifname, protocol);
 
 	if (flow_check_detection_finalized(flow, protocol) && ctx->verbose)
 		fprintf(stderr, "  [PKT %d] Flow finalized via nDPI state=%d\n",
@@ -1571,7 +1573,10 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	if (!flow->ifindex)
 		flow->ifindex = sample->ifindex;
 
-	flow_key_to_strings(&packet_view, src_ip, sizeof(src_ip), dst_ip, sizeof(dst_ip));
+	src_ip[0] = dst_ip[0] = '\0';
+	if (ctx->verbose)
+		flow_key_to_strings(&packet_view, src_ip, sizeof(src_ip),
+				    dst_ip, sizeof(dst_ip));
 
 	flow_track_handshake(flow, &packet_view, sample);
 
@@ -1634,7 +1639,7 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 					 src_ip, dst_ip);
 
 	flow_process_ndpi_result(ctx, flow, &protocol, &packet_view, ip_packet, ip_packet_len,
-				 src_ip, interface_name_by_index(ctx, sample->ifindex));
+				 interface_name_by_index(ctx, sample->ifindex));
 }
 
 static int handle_sample(void *ctx, void *data, size_t len)
