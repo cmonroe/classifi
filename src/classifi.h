@@ -216,6 +216,7 @@ struct classifi_ctx {
 	int verbose;
 	int periodic_stats;
 	int pcap_mode;
+	int discover_mode;
 	int geoip_loaded;
 
 	const char *pcap_ifname;

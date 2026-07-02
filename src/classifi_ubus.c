@@ -278,22 +278,16 @@ rules_load_from_uci(struct classifi_ctx *ctx)
 	return count;
 }
 
-int
-reload_config(struct classifi_ctx *ctx, int *out_added, int *out_removed)
+static void
+interfaces_reload(struct classifi_ctx *ctx, int *added, int *removed)
 {
 	const char *discovered[MAX_INTERFACES];
 	int num_discovered;
-	int added = 0, removed = 0;
-
-	if (ctx->bpf_prog_fd < 0) {
-		fprintf(stderr, "cannot reload: BPF program not loaded\n");
-		return -1;
-	}
 
 	num_discovered = discover_interfaces_from_uci(discovered, MAX_INTERFACES);
 	if (num_discovered == 0) {
 		fprintf(stderr, "no interfaces discovered during reload\n");
-		return 0;
+		return;
 	}
 
 	for (int i = ctx->num_interfaces - 1; i >= 0; i--) {
@@ -313,7 +307,7 @@ reload_config(struct classifi_ctx *ctx, int *out_added, int *out_removed)
 		if (!found) {
 			printf("removing interface %s (no longer in UCI config)\n", iface->name);
 			detach_interface(ctx, iface);
-			removed++;
+			(*removed)++;
 		}
 	}
 
@@ -328,14 +322,29 @@ reload_config(struct classifi_ctx *ctx, int *out_added, int *out_removed)
 
 		if (attach_tc_program(ctx, ctx->bpf_prog_fd, discovered[i], 1) == 0) {
 			printf("added interface %s\n", discovered[i]);
-			added++;
+			(*added)++;
 		} else {
 			free((void *)discovered[i]);
 		}
 	}
 
 	printf("config reload: %d added, %d removed, %d total\n",
-	       added, removed, ctx->num_interfaces);
+	       *added, *removed, ctx->num_interfaces);
+}
+
+int
+reload_config(struct classifi_ctx *ctx, int *out_added, int *out_removed)
+{
+	int added = 0, removed = 0;
+
+	if (ctx->bpf_prog_fd < 0) {
+		fprintf(stderr, "cannot reload: BPF program not loaded\n");
+		return -1;
+	}
+
+	/* Interfaces given with -i are fixed; only discover mode follows UCI */
+	if (ctx->discover_mode)
+		interfaces_reload(ctx, &added, &removed);
 
 	rules_load_from_uci(ctx);
 

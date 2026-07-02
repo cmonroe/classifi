@@ -2283,6 +2283,7 @@ int main(int argc, char **argv)
 	ctx.verbose = opts.verbose;
 	ctx.periodic_stats = opts.periodic_stats;
 	ctx.pcap_mode = opts.pcap_mode;
+	ctx.discover_mode = opts.discover_mode;
 
 	setup_signals();
 
