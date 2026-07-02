@@ -1242,6 +1242,16 @@ void ja4_table_free(struct classifi_ctx *ctx)
 	ctx->ja4_entries = 0;
 }
 
+static void ndpi_config_set(struct ndpi_detection_module_struct *ndpi_struct,
+			    const char *proto, const char *param, const char *value)
+{
+	ndpi_cfg_error rc = ndpi_set_config(ndpi_struct, proto, param, value);
+
+	if (rc != NDPI_CFG_OK)
+		fprintf(stderr, "warning: nDPI config %s%s%s=%s failed: %d\n",
+			proto ? proto : "", proto ? "." : "", param, value, rc);
+}
+
 static struct ndpi_detection_module_struct *setup_ndpi(void)
 {
 	struct ndpi_detection_module_struct *ndpi_struct;
@@ -1253,29 +1263,29 @@ static struct ndpi_detection_module_struct *setup_ndpi(void)
 	}
 
 	/* Fix TCP ACK payload heuristic issues (see nDPI issue #1946) */
-	ndpi_set_config(ndpi_struct, NULL, "tcp_ack_payload_heuristic", "enable");
+	ndpi_config_set(ndpi_struct, NULL, "tcp_ack_payload_heuristic", "enable");
 
 	/* We sample 50 packets, not the default 32 */
-	ndpi_set_config(ndpi_struct, NULL, "packets_limit_per_flow", "50");
+	ndpi_config_set(ndpi_struct, NULL, "packets_limit_per_flow", "50");
 
-	ndpi_set_config(ndpi_struct, "tls", "application_blocks_tracking", "enable");
-	ndpi_set_config(ndpi_struct, "dns", "subclassification", "enable");
-	ndpi_set_config(ndpi_struct, NULL, "fully_encrypted_heuristic", "enable");
+	ndpi_config_set(ndpi_struct, "tls", "application_blocks_tracking", "enable");
+	ndpi_config_set(ndpi_struct, "dns", "subclassification", "enable");
+	ndpi_config_set(ndpi_struct, NULL, "fully_encrypted_heuristic", "enable");
 
 	/* 0x07 enables all TLS heuristics for obfuscated/proxied traffic */
-	ndpi_set_config(ndpi_struct, "tls", "dpi.heuristics", "0x07");
+	ndpi_config_set(ndpi_struct, "tls", "dpi.heuristics", "0x07");
 
-	ndpi_set_config(ndpi_struct, NULL, "lru.tls_cert.size", "4096");
-	ndpi_set_config(ndpi_struct, NULL, "lru.stun.size", "4096");
-	ndpi_set_config(ndpi_struct, NULL, "lru.fpc_dns.size", "4096");
-	ndpi_set_config(ndpi_struct, "any", "ip_list.load", "enable");
-	ndpi_set_config(ndpi_struct, NULL, "dpi.guess_ip_before_port", "enable");
-	ndpi_set_config(ndpi_struct, NULL, "hostname_dns_check", "1");
-	ndpi_set_config(ndpi_struct, NULL, "metadata.tcp_fingerprint", "1");
-	ndpi_set_config(ndpi_struct, "tls", "blocks_analysis", "1");
+	ndpi_config_set(ndpi_struct, NULL, "lru.tls_cert.size", "4096");
+	ndpi_config_set(ndpi_struct, NULL, "lru.stun.size", "4096");
+	ndpi_config_set(ndpi_struct, NULL, "lru.fpc_dns.size", "4096");
+	ndpi_config_set(ndpi_struct, "any", "ip_list.load", "enable");
+	ndpi_config_set(ndpi_struct, NULL, "dpi.guess_ip_before_port", "enable");
+	ndpi_config_set(ndpi_struct, NULL, "hostname_dns_check", "1");
+	ndpi_config_set(ndpi_struct, NULL, "metadata.tcp_fingerprint", "1");
+	ndpi_config_set(ndpi_struct, "tls", "max_num_blocks_to_analyze", "32");
 
-	ndpi_set_config(ndpi_struct, NULL, "metadata.ndpi_fingerprint", "enable");
-	ndpi_set_config(ndpi_struct, NULL, "metadata.ndpi_fingerprint_format", "1");
+	ndpi_config_set(ndpi_struct, NULL, "metadata.ndpi_fingerprint", "enable");
+	ndpi_config_set(ndpi_struct, NULL, "metadata.ndpi_fingerprint_format", "1");
 
 	/*
 	 * Disabled for now: nDPI's ja4 custom rules (from protos.txt) overwrite
