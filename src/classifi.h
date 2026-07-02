@@ -129,6 +129,7 @@ struct ndpi_flow {
 	int packets_dir0;
 	int packets_dir1;
 	int detection_finalized;
+	int kernel_sampling_stopped;
 	int protocol_guessed;
 	int have_first_packet_key;
 	int classification_event_pending;

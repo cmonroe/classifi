@@ -1072,6 +1072,36 @@ static void flow_log_verbose_ndpi(struct classifi_ctx *ctx, struct ndpi_flow *fl
 	}
 }
 
+/*
+ * Once nDPI is done with a flow (finalized, no extra dissection, no deferred
+ * TLS/QUIC event), flip its kernel map entry to FLOW_STATE_CLASSIFIED so the
+ * BPF program stops sampling the remaining packets of the window. The
+ * lookup/update pair can race kernel-side counter increments; those counters
+ * only drive the sampling cutoff, so a lost tick is harmless.
+ */
+static void flow_sampling_stop(struct classifi_ctx *ctx, struct ndpi_flow *flow)
+{
+	struct flow_info info;
+
+	if (ctx->flow_map_fd < 0 || flow->kernel_sampling_stopped)
+		return;
+
+	if (!flow->detection_finalized || flow->classification_event_pending ||
+	    flow->flow->extra_packets_func)
+		return;
+
+	if (bpf_map_lookup_elem(ctx->flow_map_fd, &flow->key, &info) != 0)
+		return;
+
+	if (info.state != FLOW_STATE_CLASSIFIED) {
+		info.state = FLOW_STATE_CLASSIFIED;
+		if (bpf_map_update_elem(ctx->flow_map_fd, &flow->key, &info, BPF_EXIST) != 0)
+			return;
+	}
+
+	flow->kernel_sampling_stopped = 1;
+}
+
 void flow_process_ndpi_result(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			      ndpi_protocol *protocol,
 			      const struct flow_key *packet_view,
@@ -1096,6 +1126,7 @@ void flow_process_ndpi_result(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 
 	flow_detection_giveup(ctx, flow, protocol, PACKETS_TO_SAMPLE);
 	flow_handle_classification(ctx, flow, protocol, ifname);
+	flow_sampling_stop(ctx, flow);
 }
 
 int flow_handle_classification(struct classifi_ctx *ctx, struct ndpi_flow *flow,
@@ -1530,6 +1561,11 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 
 	check_rules_and_execute(ctx, flow, &packet_view, sample,
 				interface_name_by_index(ctx, sample->ifindex));
+
+	/* Samples still in the ring after the kernel entry was flipped to
+	 * FLOW_STATE_CLASSIFIED carry nothing new for nDPI; skip them. */
+	if (flow->kernel_sampling_stopped)
+		return;
 
 	if (ctx->verbose) {
 		fprintf(stderr, "sample %d (flow pkt %d, dir=%u): %s:%u -> %s:%u proto=%u len=%u l3_off=%u [dir0=%d dir1=%d]\n",
