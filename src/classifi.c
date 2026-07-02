@@ -223,7 +223,8 @@ void flow_addr_to_string(const struct flow_addr *addr, __u8 family,
 	}
 }
 
-struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *key)
+struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *key,
+				    uint64_t now_sec)
 {
 	unsigned int hash = flow_hash(key);
 	struct ndpi_flow *flow;
@@ -250,7 +251,7 @@ struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *k
 
 	memset(flow->flow, 0, SIZEOF_FLOW_STRUCT);
 
-	flow->first_seen = monotonic_time_sec();
+	flow->first_seen = now_sec;
 	flow->last_seen = flow->first_seen;
 
 	flow->next = ctx->flow_table[hash];
@@ -261,14 +262,15 @@ struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *k
 }
 
 struct ndpi_flow *flow_get_or_create(struct classifi_ctx *ctx, struct flow_key *key,
-				     const struct flow_key *packet_view, __u8 direction)
+				     const struct flow_key *packet_view, __u8 direction,
+				     uint64_t now_sec)
 {
 	struct ndpi_flow *flow;
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
 
 	flow = flow_table_lookup(ctx, key);
 	if (!flow) {
-		flow = flow_table_insert(ctx, key);
+		flow = flow_table_insert(ctx, key, now_sec);
 		if (!flow) {
 			if (ctx->verbose) {
 				flow_key_to_strings(packet_view, src_ip, sizeof(src_ip),
@@ -294,7 +296,7 @@ struct ndpi_flow *flow_get_or_create(struct classifi_ctx *ctx, struct flow_key *
 	}
 
 	flow->packets_processed++;
-	flow->last_seen = monotonic_time_sec();
+	flow->last_seen = now_sec;
 	if (direction == 0)
 		flow->packets_dir0++;
 	else
@@ -823,13 +825,14 @@ static void check_rules_and_execute(struct classifi_ctx *ctx,
 	struct classifi_rule *rule;
 	int rule_idx = 0;
 	char payload_buf[1024];
-	int payload_len;
+	int payload_len = 0;
+	__u32 all_rules_mask;
 
 	if (!ctx->rules)
 		return;
 
-	payload_len = l4_payload_get(sample, payload_buf, sizeof(payload_buf));
-	if (payload_len <= 0)
+	all_rules_mask = ctx->num_rules >= 32 ? ~0u : (1u << ctx->num_rules) - 1;
+	if ((flow->rules_matched & all_rules_mask) == all_rules_mask)
 		return;
 
 	for (rule = ctx->rules; rule && rule_idx < MAX_RULES; rule = rule->next, rule_idx++) {
@@ -855,6 +858,12 @@ static void check_rules_and_execute(struct classifi_ctx *ctx,
 			if (!ip_addr_match(&packet_view->dst, &rule->dst_ip, rule->dst_family))
 				continue;
 		}
+
+		/* Copy the payload only once a rule passes the cheap filters */
+		if (payload_len == 0)
+			payload_len = l4_payload_get(sample, payload_buf, sizeof(payload_buf));
+		if (payload_len <= 0)
+			return;
 
 		if (rule->host_header[0]) {
 			if (!host_header_match(payload_buf, rule->host_header))
@@ -949,10 +958,11 @@ void flow_update_metadata(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			flow->protocol_stack[i] = protocol->protocol_stack.protos[i];
 	}
 
-	flow->risk = flow->flow->risk;
-	if (flow->risk)
+	if (flow->flow->risk != flow->risk) {
+		flow->risk = flow->flow->risk;
 		flow->risk_score = ndpi_risk2score(flow->risk,
 			&flow->risk_score_client, &flow->risk_score_server);
+	}
 
 	flow->multimedia_types = flow->flow->flow_multimedia_types;
 
@@ -1573,6 +1583,7 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
 	struct flow_key packet_view;
 	static int total_samples = 0;
+	const char *ifname;
 
 	total_samples++;
 
@@ -1580,9 +1591,17 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	if (sample->direction)
 		swap_flow_endpoints(&packet_view);
 
-	flow = flow_get_or_create(ctx, &sample->key, &packet_view, sample->direction);
+	/* bpf_ktime_get_ns() and CLOCK_MONOTONIC share a time base, so the
+	 * sample timestamp replaces a clock_gettime call per packet. */
+	uint64_t now_sec = sample->ts_ns ? sample->ts_ns / 1000000000ULL
+					 : monotonic_time_sec();
+
+	flow = flow_get_or_create(ctx, &sample->key, &packet_view, sample->direction,
+				  now_sec);
 	if (!flow)
 		return;
+
+	ifname = interface_name_by_index(ctx, sample->ifindex);
 
 	if (!flow->ifindex)
 		flow->ifindex = sample->ifindex;
@@ -1594,8 +1613,7 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 
 	flow_track_handshake(flow, &packet_view, sample);
 
-	check_rules_and_execute(ctx, flow, &packet_view, sample,
-				interface_name_by_index(ctx, sample->ifindex));
+	check_rules_and_execute(ctx, flow, &packet_view, sample, ifname);
 
 	/* Samples still in the ring after the kernel entry was flipped to
 	 * FLOW_STATE_CLASSIFIED carry nothing new for nDPI; skip them. */
@@ -1640,7 +1658,7 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		log_ip_header_debug(ip_packet, ip_packet_len, sample->direction,
 				    src_ip, dst_ip, l3_offset);
 
-	u_int64_t time_ms = sample->ts_ns ? sample->ts_ns / 1000000ULL : monotonic_time_sec() * 1000ULL;
+	u_int64_t time_ms = sample->ts_ns ? sample->ts_ns / 1000000ULL : now_sec * 1000ULL;
 
 	flow->input_info.in_pkt_dir = NDPI_IN_PKT_DIR_UNKNOWN;
 
@@ -1653,7 +1671,7 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 					 src_ip, dst_ip);
 
 	flow_process_ndpi_result(ctx, flow, &protocol, &packet_view, ip_packet, ip_packet_len,
-				 interface_name_by_index(ctx, sample->ifindex));
+				 ifname);
 }
 
 static int handle_sample(void *ctx, void *data, size_t len)

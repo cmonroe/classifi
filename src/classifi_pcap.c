@@ -185,7 +185,8 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 	if (direction)
 		swap_flow_endpoints(&packet_view);
 
-	flow = flow_get_or_create(ctx, &key, &packet_view, direction);
+	flow = flow_get_or_create(ctx, &key, &packet_view, direction,
+				  monotonic_time_sec());
 	if (!flow)
 		return;
 

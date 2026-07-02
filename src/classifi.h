@@ -232,9 +232,11 @@ void flow_key_to_strings(const struct flow_key *key,
 void flow_addr_to_string(const struct flow_addr *addr, __u8 family,
 			 char *out, size_t out_len);
 struct ndpi_flow *flow_table_lookup(struct classifi_ctx *ctx, const struct flow_key *key);
-struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *key);
+struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *key,
+				    uint64_t now_sec);
 struct ndpi_flow *flow_get_or_create(struct classifi_ctx *ctx, struct flow_key *key,
-				     const struct flow_key *packet_view, __u8 direction);
+				     const struct flow_key *packet_view, __u8 direction,
+				     uint64_t now_sec);
 int tls_quic_metadata_ready(struct ndpi_flow *flow);
 void network_quality_to_blob(struct blob_buf *b, const struct ndpi_flow *flow);
 void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,

@@ -355,6 +355,7 @@ struct flow_blob_ctx {
 	struct blob_buf *b;
 	int count;
 	int truncated;
+	uint64_t now;
 };
 
 static void
@@ -371,7 +372,7 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
 	const char *master_name, *app_name, *category_name;
 	struct flow_key *display_key;
-	uint64_t now = monotonic_time_sec();
+	uint64_t now = fbc->now;
 
 	display_key = flow_display_key(flow);
 
@@ -585,7 +586,7 @@ classifi_get_flows_handler(struct ubus_context *uctx, struct ubus_object *obj,
 			   struct blob_attr *msg)
 {
 	struct blob_buf b = {};
-	struct flow_blob_ctx fbc = { .b = &b, .count = 0 };
+	struct flow_blob_ctx fbc = { .b = &b, .now = monotonic_time_sec() };
 	void *flows_array;
 
 	(void)obj;
