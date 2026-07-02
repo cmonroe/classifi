@@ -20,6 +20,10 @@
 #define offsetof(TYPE, MEMBER) __builtin_offsetof(TYPE, MEMBER)
 #endif
 
+#ifndef IP_OFFSET
+#define IP_OFFSET 0x1FFF
+#endif
+
 #define MAX_FLOWS 8192
 
 /*

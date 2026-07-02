@@ -119,6 +119,10 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 		*l3_offset = offset;
 		offset += ip_hdr_len;
 
+		/* Non-first fragments carry no L4 header; leave ports zero */
+		if (iph->frag_off & bpf_htons(IP_OFFSET))
+			return 0;
+
 		if (iph->protocol == IPPROTO_TCP) {
 			struct tcphdr *tcph = data + offset;
 			__u32 tcp_hdr_len;

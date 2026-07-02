@@ -126,6 +126,10 @@ static int parse_packet_libpcap(const unsigned char *packet, int packet_len,
 		*l3_data = (unsigned char *)ptr;
 		*l3_len = packet_len - offset;
 
+		/* Non-first fragments carry no L4 header; leave ports zero */
+		if (iph->frag_off & htons(IP_OFFSET))
+			return 0;
+
 		offset += ip_hdr_len;
 		ptr = packet + offset;
 
