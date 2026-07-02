@@ -133,6 +133,7 @@ struct ndpi_flow {
 	int protocol_guessed;
 	int have_first_packet_key;
 	int classification_event_pending;
+	int ifindex;
 	uint64_t first_seen;
 	uint64_t last_seen;
 	char tcp_fingerprint[64];

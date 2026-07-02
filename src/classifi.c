@@ -1555,6 +1555,9 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	if (!flow)
 		return;
 
+	if (!flow->ifindex)
+		flow->ifindex = sample->ifindex;
+
 	flow_key_to_strings(&packet_view, src_ip, sizeof(src_ip), dst_ip, sizeof(dst_ip));
 
 	flow_track_handshake(flow, &packet_view, sample);
@@ -1808,13 +1811,71 @@ static void print_classified_flows(struct classifi_ctx *ctx)
 	}
 }
 
-static void flow_free(struct classifi_ctx *ctx, struct ndpi_flow *flow)
+static void flow_free(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+		      int keep_kernel_entry)
 {
-	if (ctx->flow_map_fd >= 0)
+	if (!keep_kernel_entry && ctx->flow_map_fd >= 0)
 		bpf_map_delete_elem(ctx->flow_map_fd, &flow->key);
 	if (flow->flow)
 		ndpi_flow_free(flow->flow);
 	free(flow);
+}
+
+static const char *flow_event_ifname(struct classifi_ctx *ctx, struct ndpi_flow *flow)
+{
+	if (ctx->pcap_ifname)
+		return ctx->pcap_ifname;
+	return interface_name_by_index(ctx, flow->ifindex);
+}
+
+/* A deferred TLS/QUIC event whose ClientHello never showed up would otherwise
+ * vanish with the flow; emit it with the metadata gathered so far. */
+static void flow_flush_pending_event(struct classifi_ctx *ctx, struct ndpi_flow *flow)
+{
+	if (!flow->classification_event_pending)
+		return;
+
+	geoip_flow_resolve(ctx, flow);
+	emit_classification_event(ctx, flow, flow_event_ifname(ctx, flow));
+	flow->classification_event_pending = 0;
+}
+
+/*
+ * Userspace last_seen freezes once the kernel stops sampling, so an expiry
+ * decision based on it alone would tear down every flow that outlives its
+ * sampling window and restart sampling and classification from scratch on
+ * the next packet. Consult the kernel entry: while the flow is still active
+ * on the wire, release the userspace state but keep the kernel entry in a
+ * non-NEW state so the flow stays classified exactly once. Flows the kernel
+ * is still sampling (state NEW, detection unfinished) are left alone.
+ */
+static int flow_expire(struct classifi_ctx *ctx, struct ndpi_flow *flow, uint64_t now)
+{
+	struct flow_info kinfo;
+	int kernel_active = 0;
+	int kernel_new = 0;
+
+	if (ctx->flow_map_fd >= 0 &&
+	    bpf_map_lookup_elem(ctx->flow_map_fd, &flow->key, &kinfo) == 0) {
+		uint64_t k_last_sec = kinfo.last_seen / 1000000000ULL;
+		uint64_t k_idle = now > k_last_sec ? now - k_last_sec : 0;
+
+		kernel_active = k_idle < FLOW_IDLE_TIMEOUT;
+		kernel_new = kinfo.state == FLOW_STATE_NEW;
+	}
+
+	if (kernel_active && kernel_new && !flow->detection_finalized)
+		return 0;
+
+	if (kernel_active && kernel_new) {
+		kinfo.state = FLOW_STATE_SAMPLED;
+		bpf_map_update_elem(ctx->flow_map_fd, &flow->key, &kinfo, BPF_EXIST);
+	}
+
+	flow_flush_pending_event(ctx, flow);
+	flow_free(ctx, flow, kernel_active);
+
+	return 1;
 }
 
 void cleanup_expired_flows(struct classifi_ctx *ctx)
@@ -1840,17 +1901,22 @@ void cleanup_expired_flows(struct classifi_ctx *ctx)
 				continue;
 			}
 
+			if (!flow_expire(ctx, flow, now)) {
+				prev = &flow->next;
+				flow = next;
+				continue;
+			}
+
 			if (ctx->verbose) {
 				if (idle_time >= FLOW_IDLE_TIMEOUT)
-					fprintf(stderr, "expiring idle flow (idle %llu sec)\n",
+					fprintf(stderr, "expired idle flow (idle %llu sec)\n",
 						(unsigned long long)idle_time);
 				else
-					fprintf(stderr, "expiring old flow (age %llu sec)\n",
+					fprintf(stderr, "expired old flow (age %llu sec)\n",
 						(unsigned long long)age);
 			}
 
 			*prev = next;
-			flow_free(ctx, flow);
 			flow = next;
 			expired_flows++;
 		}
