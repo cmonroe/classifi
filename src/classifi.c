@@ -586,16 +586,19 @@ void emit_dns_event(struct classifi_ctx *ctx, const char *client_ip, const char 
 #define TCP_F_ACK 0x10
 
 /*
- * Validate that the sample holds a complete IPv4/IPv6 TCP header and return a
- * pointer to it (NULL otherwise). When non-NULL, ip_hdr_len_out receives the L3
- * header length so callers can locate the TCP payload without re-walking.
+ * Validate that the sample holds a complete IPv4/IPv6 TCP or UDP header and
+ * return a pointer to it (NULL otherwise). When non-NULL, ip_hdr_len_out
+ * receives the L3 header length so callers can locate the L4 payload without
+ * re-walking.
  */
-static const struct tcphdr *tcp_hdr_locate(const struct packet_sample *sample,
-					   unsigned int *ip_hdr_len_out)
+static const void *l4_hdr_locate(const struct packet_sample *sample,
+				 unsigned int *ip_hdr_len_out)
 {
 	unsigned int l3_offset = sample->l3_offset;
 	const unsigned char *ip_packet;
 	unsigned int ip_hdr_len;
+	unsigned int l4_min_len;
+	__u8 protocol;
 
 	if (l3_offset >= sample->data_len)
 		return NULL;
@@ -607,48 +610,60 @@ static const struct tcphdr *tcp_hdr_locate(const struct packet_sample *sample,
 
 		if (l3_offset + sizeof(struct iphdr) > sample->data_len)
 			return NULL;
-		if (iph->protocol != IPPROTO_TCP)
-			return NULL;
 
+		protocol = iph->protocol;
 		ip_hdr_len = iph->ihl * 4;
 	} else if (sample->key.family == FLOW_FAMILY_IPV6) {
 		const struct ipv6hdr *ip6h = (const struct ipv6hdr *)ip_packet;
 
 		if (l3_offset + sizeof(struct ipv6hdr) > sample->data_len)
 			return NULL;
-		if (ip6h->nexthdr != IPPROTO_TCP)
-			return NULL;
 
+		protocol = ip6h->nexthdr;
 		ip_hdr_len = sizeof(struct ipv6hdr);
 	} else {
 		return NULL;
 	}
 
-	if (l3_offset + ip_hdr_len + sizeof(struct tcphdr) > sample->data_len)
+	if (protocol == IPPROTO_TCP)
+		l4_min_len = sizeof(struct tcphdr);
+	else if (protocol == IPPROTO_UDP)
+		l4_min_len = sizeof(struct udphdr);
+	else
+		return NULL;
+
+	if (l3_offset + ip_hdr_len + l4_min_len > sample->data_len)
 		return NULL;
 
 	if (ip_hdr_len_out)
 		*ip_hdr_len_out = ip_hdr_len;
 
-	return (const struct tcphdr *)(ip_packet + ip_hdr_len);
+	return ip_packet + ip_hdr_len;
 }
 
-static int get_tcp_payload(struct packet_sample *sample, char *buf, size_t buf_len)
+static int l4_payload_get(struct packet_sample *sample, char *buf, size_t buf_len)
 {
-	unsigned int ip_hdr_len, tcp_hdr_len, payload_len;
+	unsigned int ip_hdr_len, l4_hdr_len, payload_len;
 	const unsigned char *payload;
-	const struct tcphdr *tcph;
+	const void *l4;
 
-	tcph = tcp_hdr_locate(sample, &ip_hdr_len);
-	if (!tcph)
+	l4 = l4_hdr_locate(sample, &ip_hdr_len);
+	if (!l4)
 		return -1;
 
-	tcp_hdr_len = tcph->doff * 4;
-	if (sample->l3_offset + ip_hdr_len + tcp_hdr_len > sample->data_len)
+	if (sample->key.protocol == IPPROTO_TCP) {
+		l4_hdr_len = ((const struct tcphdr *)l4)->doff * 4;
+		if (l4_hdr_len < sizeof(struct tcphdr))
+			return -1;
+	} else {
+		l4_hdr_len = sizeof(struct udphdr);
+	}
+
+	if (sample->l3_offset + ip_hdr_len + l4_hdr_len > sample->data_len)
 		return -1;
 
-	payload = (const unsigned char *)tcph + tcp_hdr_len;
-	payload_len = sample->data_len - sample->l3_offset - ip_hdr_len - tcp_hdr_len;
+	payload = (const unsigned char *)l4 + l4_hdr_len;
+	payload_len = sample->data_len - sample->l3_offset - ip_hdr_len - l4_hdr_len;
 
 	if (payload_len == 0)
 		return -1;
@@ -816,7 +831,7 @@ static void check_rules_and_execute(struct classifi_ctx *ctx,
 	if (!ctx->rules)
 		return;
 
-	payload_len = get_tcp_payload(sample, payload_buf, sizeof(payload_buf));
+	payload_len = l4_payload_get(sample, payload_buf, sizeof(payload_buf));
 	if (payload_len <= 0)
 		return;
 
