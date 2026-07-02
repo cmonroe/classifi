@@ -755,7 +755,7 @@ static void emit_rule_match_event(struct classifi_ctx *ctx,
 	blobmsg_add_u32(&b, "protocol", key->protocol);
 
 	for (int i = 0; i < num_extracts && i < MAX_EXTRACTS; i++) {
-		char field_name[16];
+		char field_name[20];
 		snprintf(field_name, sizeof(field_name), "match_%d", i + 1);
 		blobmsg_add_string(&b, field_name, extracts[i]);
 	}
