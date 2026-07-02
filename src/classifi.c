@@ -970,7 +970,12 @@ void flow_check_dns_query(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 		return;
 
 	dns_payload = dns_payload_extract(l3_data, l3_len, packet_view->family, &dns_len);
-	if (!dns_payload || dns_len == 0)
+	if (!dns_payload || dns_len < DNS_HEADER_SIZE)
+		return;
+
+	/* Responses repeat the question section; the QR bit keeps them from
+	 * emitting a duplicate event with the server as client_ip. */
+	if (dns_payload[2] & 0x80)
 		return;
 
 	if (extract_dns_query_name(dns_payload, dns_len, query_name, sizeof(query_name), &qtype) != 0)
