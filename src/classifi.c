@@ -408,17 +408,19 @@ void geoip_flow_resolve(struct classifi_ctx *ctx, struct ndpi_flow *flow)
 
 	key = flow_display_key(flow);
 
+	/* nDPI writes buf[len] = '\0' when the looked-up string fills the
+	 * given length, so pass one less than the buffer size. */
 	flow_addr_to_string(&key->src, key->family, ip_str, sizeof(ip_str));
 	ndpi_get_geoip_country_continent(ctx->ndpi, ip_str,
-		flow->src_country, sizeof(flow->src_country), NULL, 0);
+		flow->src_country, sizeof(flow->src_country) - 1, NULL, 0);
 	ndpi_get_geoip_asn(ctx->ndpi, ip_str, &flow->src_asn);
-	ndpi_get_geoip_aso(ctx->ndpi, ip_str, flow->src_aso, sizeof(flow->src_aso));
+	ndpi_get_geoip_aso(ctx->ndpi, ip_str, flow->src_aso, sizeof(flow->src_aso) - 1);
 
 	flow_addr_to_string(&key->dst, key->family, ip_str, sizeof(ip_str));
 	ndpi_get_geoip_country_continent(ctx->ndpi, ip_str,
-		flow->dst_country, sizeof(flow->dst_country), NULL, 0);
+		flow->dst_country, sizeof(flow->dst_country) - 1, NULL, 0);
 	ndpi_get_geoip_asn(ctx->ndpi, ip_str, &flow->dst_asn);
-	ndpi_get_geoip_aso(ctx->ndpi, ip_str, flow->dst_aso, sizeof(flow->dst_aso));
+	ndpi_get_geoip_aso(ctx->ndpi, ip_str, flow->dst_aso, sizeof(flow->dst_aso) - 1);
 }
 
 /* Round-to-nearest ns->us with 32-bit saturation, so a sub-microsecond leg does
