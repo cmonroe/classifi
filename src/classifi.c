@@ -1993,6 +1993,8 @@ static void stats_timer_cb(struct uloop_timeout *t)
 {
 	struct classifi_ctx *ctx = container_of(t, struct classifi_ctx, stats_timer);
 	print_ringbuf_stats(ctx);
+	if (ctx->periodic_stats)
+		print_classified_flows(ctx);
 	uloop_timeout_set(t, 10 * 1000);
 }
 
