@@ -216,6 +216,7 @@ struct classifi_ctx {
 	struct dump_writer *dump;
 
 	__u64 last_ringbuf_drops;
+	uint64_t last_pressure_cleanup;
 };
 
 typedef void (*flow_visitor_fn)(struct classifi_ctx *ctx,

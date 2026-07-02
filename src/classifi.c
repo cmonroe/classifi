@@ -223,6 +223,27 @@ void flow_addr_to_string(const struct flow_addr *addr, __u8 family,
 	}
 }
 
+/*
+ * Under a flow flood the table can sit at the cap for up to CLEANUP_INTERVAL
+ * while holding expired entries (~2KB each); pull the cleanup forward so the
+ * memory is reclaimed as soon as flows become eligible. cleanup_timer has no
+ * callback in pcap mode, which runs its own periodic cleanup.
+ */
+static void flow_table_pressure_check(struct classifi_ctx *ctx, uint64_t now_sec)
+{
+	if (ctx->num_flows < MAX_USERSPACE_FLOWS - MAX_USERSPACE_FLOWS / 8)
+		return;
+
+	if (!ctx->cleanup_timer.cb)
+		return;
+
+	if (now_sec - ctx->last_pressure_cleanup < 1)
+		return;
+
+	ctx->last_pressure_cleanup = now_sec;
+	uloop_timeout_set(&ctx->cleanup_timer, 0);
+}
+
 struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *key,
 				    uint64_t now_sec)
 {
@@ -257,6 +278,8 @@ struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *k
 	flow->next = ctx->flow_table[hash];
 	ctx->flow_table[hash] = flow;
 	ctx->num_flows++;
+
+	flow_table_pressure_check(ctx, now_sec);
 
 	return flow;
 }
