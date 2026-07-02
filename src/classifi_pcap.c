@@ -199,6 +199,9 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 			l3_len, flow->packets_dir0, flow->packets_dir1);
 	}
 
+	if (!flow->flow)
+		return;
+
 	if (flow->detection_finalized) {
 		if (ctx->verbose)
 			fprintf(stderr, "  [SKIP CHECK] finalized=%d hsn=%d ch=%d pkts=%d\n",
@@ -208,8 +211,10 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 				flow->packets_processed);
 		if (flow->flow->host_server_name[0] ||
 		    flow->flow->protos.tls_quic.client_hello_processed ||
-		    flow->packets_processed >= PACKETS_TO_SAMPLE)
+		    flow->packets_processed >= PACKETS_TO_SAMPLE) {
+			flow_ndpi_state_release(ctx, flow);
 			return;
+		}
 	}
 
 	if (!l3_data || l3_len == 0) {
@@ -300,9 +305,9 @@ static void print_flow_summary(struct classifi_ctx *ctx)
 				fprintf(stderr, " (guessed)");
 			fprintf(stderr, "\n");
 
-			if (f->flow->host_server_name[0])
+			if (flow_hostname(f)[0])
 				fprintf(stderr, "    hostname: %s\n",
-					f->flow->host_server_name);
+					flow_hostname(f));
 
 			if (f->tcp_fingerprint[0])
 				fprintf(stderr, "    tcp_fp: %s (%s)\n",

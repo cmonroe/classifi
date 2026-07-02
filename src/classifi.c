@@ -413,11 +413,41 @@ int tls_quic_metadata_ready(struct ndpi_flow *flow)
 	u_int16_t master = flow->protocol.proto.master_protocol;
 	u_int16_t app = flow->protocol.proto.app_protocol;
 
+	if (!flow->flow)
+		return 1;
+
 	if (!is_tls_or_quic(master) && !is_tls_or_quic(app))
 		return 1;
 
 	return flow->detection_finalized ||
 	       flow->flow->protos.tls_quic.client_hello_processed;
+}
+
+/*
+ * The nDPI flow state (~1.2KB, the bulk of a tracked flow) is only needed
+ * while packets still reach the dissector. Once detection is finalized, the
+ * classification event is out and, in eBPF mode, the kernel entry has been
+ * flipped so no further samples arrive, snapshot the hostname and free it.
+ * The wrapper stays for get_flows/expiry bookkeeping.
+ */
+void flow_ndpi_state_release(struct classifi_ctx *ctx, struct ndpi_flow *flow)
+{
+	if (!flow->flow)
+		return;
+
+	if (!flow->detection_finalized || flow->classification_event_pending)
+		return;
+
+	if (flow->flow->extra_packets_func)
+		return;
+
+	if (ctx->flow_map_fd >= 0 && !flow->kernel_sampling_stopped)
+		return;
+
+	snprintf(flow->hostname, sizeof(flow->hostname), "%s",
+		 flow->flow->host_server_name);
+	ndpi_flow_free(flow->flow);
+	flow->flow = NULL;
 }
 
 void geoip_flow_resolve(struct classifi_ctx *ctx, struct ndpi_flow *flow)
@@ -527,8 +557,8 @@ void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 		blobmsg_add_string(&b, "ndpi_fingerprint", flow->ndpi_fingerprint);
 	if (flow->detection_method[0])
 		blobmsg_add_string(&b, "detection_method", flow->detection_method);
-	if (flow->flow->host_server_name[0])
-		blobmsg_add_string(&b, "hostname", flow->flow->host_server_name);
+	if (flow_hostname(flow)[0])
+		blobmsg_add_string(&b, "hostname", flow_hostname(flow));
 
 	if (flow->src_country[0])
 		blobmsg_add_string(&b, "src_country", flow->src_country);
@@ -1189,6 +1219,11 @@ void flow_process_ndpi_result(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 	flow_detection_giveup(ctx, flow, protocol, PACKETS_TO_SAMPLE);
 	flow_handle_classification(ctx, flow, protocol, ifname);
 	flow_sampling_stop(ctx, flow);
+
+	/* pcap mode keeps dissecting finalized flows until the hostname hunt
+	 * in pcap_packet_handler() concludes; it releases the state itself. */
+	if (ctx->flow_map_fd >= 0)
+		flow_ndpi_state_release(ctx, flow);
 }
 
 int flow_handle_classification(struct classifi_ctx *ctx, struct ndpi_flow *flow,
@@ -1639,8 +1674,9 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	check_rules_and_execute(ctx, flow, &packet_view, sample, ifname);
 
 	/* Samples still in the ring after the kernel entry was flipped to
-	 * FLOW_STATE_CLASSIFIED carry nothing new for nDPI; skip them. */
-	if (flow->kernel_sampling_stopped)
+	 * FLOW_STATE_CLASSIFIED carry nothing new for nDPI; skip them. The
+	 * nDPI state may already be released at that point. */
+	if (flow->kernel_sampling_stopped || !flow->flow)
 		return;
 
 	if (ctx->verbose) {

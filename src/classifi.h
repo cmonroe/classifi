@@ -159,6 +159,8 @@ struct ndpi_flow {
 	int protocol_stack_count;
 	u_int16_t protocol_stack[MAX_PROTOCOL_STACK_SIZE];
 	__u32 rules_matched;
+	/* host_server_name snapshot; valid once flow->flow is released */
+	char hostname[sizeof(((struct ndpi_flow_struct *)0)->host_server_name)];
 
 	ndpi_risk risk;
 	u_int16_t risk_score;
@@ -177,6 +179,11 @@ struct ndpi_flow {
 static inline struct flow_key *flow_display_key(struct ndpi_flow *flow)
 {
 	return flow->have_first_packet_key ? &flow->first_packet_key : &flow->key;
+}
+
+static inline const char *flow_hostname(const struct ndpi_flow *flow)
+{
+	return flow->flow ? flow->flow->host_server_name : flow->hostname;
 }
 
 struct classifi_ctx {
@@ -239,6 +246,7 @@ struct ndpi_flow *flow_get_or_create(struct classifi_ctx *ctx, struct flow_key *
 				     const struct flow_key *packet_view, __u8 direction,
 				     uint64_t now_sec);
 int tls_quic_metadata_ready(struct ndpi_flow *flow);
+void flow_ndpi_state_release(struct classifi_ctx *ctx, struct ndpi_flow *flow);
 void network_quality_to_blob(struct blob_buf *b, const struct ndpi_flow *flow);
 void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			       const char *ifname);

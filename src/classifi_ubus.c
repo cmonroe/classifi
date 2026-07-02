@@ -419,8 +419,8 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 		blobmsg_add_string(b, "ndpi_fingerprint", flow->ndpi_fingerprint);
 	if (flow->detection_method[0])
 		blobmsg_add_string(b, "detection_method", flow->detection_method);
-	if (flow->flow->host_server_name[0])
-		blobmsg_add_string(b, "hostname", flow->flow->host_server_name);
+	if (flow_hostname(flow)[0])
+		blobmsg_add_string(b, "hostname", flow_hostname(flow));
 
 	if (flow->src_country[0])
 		blobmsg_add_string(b, "src_country", flow->src_country);
