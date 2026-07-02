@@ -92,6 +92,34 @@ struct interface_info {
 	__u32 tc_priority_egress;
 };
 
+/*
+ * TCP-handshake / network-quality state. The tracked connection on a canonical
+ * 5-tuple is identified by (syn_seq, syn_direction); a fresh SYN with a different
+ * ISN re-arms it. *_ts_ns and *_ns hold kernel-monotonic nanoseconds; RTTs are
+ * converted to microseconds only at emit. The *_measured bits record what was
+ * actually observed so a measured-zero RTT is distinct from never-measured.
+ * A leg that saw retransmits yields no RTT (Karn: the sample is ambiguous);
+ * only the saturating retransmit counters report such loss.
+ */
+struct tcp_handshake {
+	__u64 syn_ts_ns;            /* ts of the SYN used as the baseline */
+	__u64 synack_ts_ns;         /* ts of the SYN-ACK answering syn_seq */
+	__u64 handshake_rtt_ns;     /* SYN -> SYN-ACK: initiator->responder leg */
+	__u64 client_rtt_ns;        /* SYN-ACK -> ACK: responder->initiator leg */
+	__u64 setup_ns;             /* SYN -> ACK: full observed 3-way setup */
+	__u32 syn_seq;              /* host-order ISN of the tracked SYN (identity) */
+	__u32 synack_seq;           /* host-order ISN of the tracked SYN-ACK */
+	__u8 syn_direction;         /* sample->direction of the tracked SYN */
+	__u8 saw_syn;
+	__u8 saw_synack;
+	__u8 complete;
+	__u8 rtt_measured;          /* handshake_rtt_ns is a real measurement (incl 0) */
+	__u8 client_measured;       /* client_rtt_ns is a real measurement (incl 0) */
+	__u8 setup_measured;        /* setup_ns is a real measurement (incl 0) */
+	__u8 syn_retransmits;       /* saturating */
+	__u8 synack_retransmits;    /* saturating */
+};
+
 struct ndpi_flow {
 	struct flow_key key;
 	struct flow_key first_packet_key;
@@ -129,17 +157,7 @@ struct ndpi_flow {
 
 	u_int8_t multimedia_types;
 
-	/* network-quality metrics; *_ts_ns are internal scratch (kernel monotonic ns) */
-	__u64 syn_ts_ns;            /* first SYN (no ACK) */
-	__u64 synack_ts_ns;         /* first SYN+ACK */
-	__u32 handshake_rtt_us;     /* synack - syn: device->server (WAN) RTT */
-	__u32 client_rtt_us;        /* ack - synack: device->client (LAN) RTT */
-	__u32 setup_us;             /* ack - syn: device-observed 3-way setup */
-	__u8 saw_syn;
-	__u8 saw_synack;
-	__u8 handshake_complete;
-	__u8 syn_retransmits;       /* saturating */
-	__u8 synack_retransmits;    /* saturating */
+	struct tcp_handshake hs;
 
 	struct ndpi_flow_input_info input_info;
 

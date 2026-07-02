@@ -408,25 +408,40 @@ void geoip_flow_resolve(struct classifi_ctx *ctx, struct ndpi_flow *flow)
 	ndpi_get_geoip_aso(ctx->ndpi, ip_str, flow->dst_aso, sizeof(flow->dst_aso));
 }
 
+/* Round-to-nearest ns->us with 32-bit saturation, so a sub-microsecond leg does
+ * not truncate to a 0 that the emit path cannot tell from "not measured". */
+static __u32 ns_us_round(__u64 delta_ns)
+{
+	__u64 us = (delta_ns + 500ULL) / 1000ULL;
+
+	return us > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (__u32)us;
+}
+
 void network_quality_to_blob(struct blob_buf *b, const struct ndpi_flow *flow)
 {
+	const struct tcp_handshake *hs = &flow->hs;
 	void *nq;
 
-	if (!flow->handshake_rtt_us && !flow->client_rtt_us && !flow->setup_us &&
-	    !flow->syn_retransmits && !flow->synack_retransmits)
+	/* No SYN sampled at all (daemon restart over an established flow, BPF map
+	 * LRU eviction, or mid-stream attach): emit nothing, so absence of the
+	 * table is unambiguous and distinct from a measured-but-zero handshake. */
+	if (!hs->saw_syn)
 		return;
 
 	nq = blobmsg_open_table(b, "network_quality");
-	if (flow->handshake_rtt_us)
-		blobmsg_add_u32(b, "handshake_rtt_us", flow->handshake_rtt_us);
-	if (flow->client_rtt_us)
-		blobmsg_add_u32(b, "client_rtt_us", flow->client_rtt_us);
-	if (flow->setup_us)
-		blobmsg_add_u32(b, "setup_us", flow->setup_us);
-	if (flow->syn_retransmits)
-		blobmsg_add_u32(b, "syn_retransmits", flow->syn_retransmits);
-	if (flow->synack_retransmits)
-		blobmsg_add_u32(b, "synack_retransmits", flow->synack_retransmits);
+	blobmsg_add_u8(b, "handshake_observed", 1);
+	blobmsg_add_u8(b, "handshake_complete", hs->complete ? 1 : 0);
+
+	if (hs->rtt_measured)
+		blobmsg_add_u32(b, "handshake_rtt_us", ns_us_round(hs->handshake_rtt_ns));
+	if (hs->client_measured)
+		blobmsg_add_u32(b, "client_rtt_us", ns_us_round(hs->client_rtt_ns));
+	if (hs->setup_measured)
+		blobmsg_add_u32(b, "setup_us", ns_us_round(hs->setup_ns));
+	if (hs->syn_retransmits)
+		blobmsg_add_u32(b, "syn_retransmits", hs->syn_retransmits);
+	if (hs->synack_retransmits)
+		blobmsg_add_u32(b, "synack_retransmits", hs->synack_retransmits);
 	blobmsg_close_table(b, nq);
 }
 
@@ -1355,23 +1370,39 @@ static void log_ndpi_direction_debug(struct ndpi_flow *flow, const struct flow_k
 }
 
 /*
- * Stamp TCP 3-way handshake timestamps from per-packet kernel time and derive
- * RTTs. Measured at the LAN bridge: SYN->SYN-ACK is the device->server (WAN)
- * round trip, SYN-ACK->ACK is the device->client (LAN) round trip. Handshake
- * packets identified by TCP flags (sample->direction is only a canonical-order
- * label, not client/server).
+ * Track the TCP 3-way handshake and derive per-leg RTTs (kept in ns, converted
+ * to us only at emit). seq/ack and the payload length come straight from the BPF
+ * sample (parse_flow_key lifted them out of the validated L4 header), so nothing
+ * is re-parsed here. The connection is identified by the client ISN (syn_seq)
+ * plus the initiator's canonical-order bit (sample->direction of the SYN):
+ *   initiator->responder leg = SYN     -> SYN-ACK  (handshake_rtt_ns)
+ *   responder->initiator leg = SYN-ACK -> ACK      (client_rtt_ns)
+ * Anchoring on the SYN's direction labels inbound/port-forwarded flows correctly
+ * instead of assuming the local device sent the SYN. Correlating by seq/ack (not
+ * flags alone) means a PSH+ACK data segment cannot complete the handshake, and a
+ * fresh SYN with a different ISN re-arms the machine so a 5-tuple reused within
+ * the sampling window (BPF stops sampling after PACKETS_TO_SAMPLE packets) is
+ * re-measured rather than re-emitting the prior connection.
+ *
+ * A retransmitted SYN or SYN-ACK makes that leg's RTT sample ambiguous (the
+ * answer may pair with any copy, per Karn), so the leg is left unmeasured and
+ * only the retransmit counter reports the loss. setup_ns stays anchored to the
+ * earliest SYN: first-SYN to ACK is the setup time the initiator experienced
+ * regardless of which copy was answered.
  */
 static void flow_track_handshake(struct ndpi_flow *flow,
 				 const struct flow_key *packet_view,
 				 const struct packet_sample *sample)
 {
+	struct tcp_handshake *hs = &flow->hs;
 	__u64 ts = sample->ts_ns;
 	__u8 flags = sample->tcp_flags;
+	__u8 dir = sample->direction;
+	__u32 seq = sample->tcp_seq;
+	__u32 ack = sample->tcp_ack_seq;
 	int is_syn, is_synack, is_ack;
 
 	if (packet_view->protocol != IPPROTO_TCP)
-		return;
-	if (flow->handshake_complete)
 		return;
 	if (!ts)
 		return;
@@ -1380,40 +1411,83 @@ static void flow_track_handshake(struct ndpi_flow *flow,
 	is_synack = (flags & (TCP_F_SYN | TCP_F_ACK)) == (TCP_F_SYN | TCP_F_ACK);
 	is_ack = (flags & TCP_F_ACK) && !(flags & (TCP_F_SYN | TCP_F_RST | TCP_F_FIN));
 
+	/* Once complete, only a fresh SYN (handled below) may re-arm; ignore stray
+	 * post-handshake SYN-ACK/ACK so they cannot disturb the recorded result. */
+	if (hs->complete && !is_syn)
+		return;
+
 	if (is_syn) {
-		if (!flow->saw_syn) {
-			flow->syn_ts_ns = ts;
-			flow->saw_syn = 1;
-		} else if (!flow->saw_synack && flow->syn_retransmits < 0xFF) {
-			/* Duplicate SYN before any SYN-ACK is WAN-side loss; reset the
-			 * baseline so RTT reflects the attempt that gets answered rather
-			 * than being inflated by the retransmit timeout. */
-			flow->syn_ts_ns = ts;
-			flow->syn_retransmits++;
+		if (hs->saw_syn && seq != hs->syn_seq)
+			memset(hs, 0, sizeof(*hs));
+
+		if (!hs->saw_syn) {
+			hs->syn_ts_ns = ts;
+			hs->syn_seq = seq;
+			hs->syn_direction = dir;
+			hs->saw_syn = 1;
+			return;
+		}
+
+		/* Same-ISN duplicate SYN before any SYN-ACK is initiator-side loss.
+		 * Keep the earliest ts as the setup_ns anchor; the leg RTT is dropped
+		 * below (Karn) so the anchor choice cannot skew it. */
+		if (!hs->saw_synack) {
+			if (ts < hs->syn_ts_ns)
+				hs->syn_ts_ns = ts;
+			if (hs->syn_retransmits < 0xFF)
+				hs->syn_retransmits++;
 		}
 		return;
 	}
 
 	if (is_synack) {
-		if (!flow->saw_syn)
+		if (!hs->saw_syn)
 			return;
-		if (!flow->saw_synack) {
-			flow->synack_ts_ns = ts;
-			flow->saw_synack = 1;
-			if (ts > flow->syn_ts_ns)
-				flow->handshake_rtt_us = (__u32)((ts - flow->syn_ts_ns) / 1000ULL);
-		} else if (flow->synack_retransmits < 0xFF) {
-			flow->synack_retransmits++;
+		if (dir == hs->syn_direction)          /* SYN-ACK comes from the responder */
+			return;
+		if (ack != hs->syn_seq + 1U)           /* must acknowledge our SYN */
+			return;
+
+		if (!hs->saw_synack) {
+			hs->synack_ts_ns = ts;
+			hs->synack_seq = seq;
+			hs->saw_synack = 1;
+			if (!hs->syn_retransmits && ts >= hs->syn_ts_ns) {
+				hs->handshake_rtt_ns = ts - hs->syn_ts_ns;
+				hs->rtt_measured = 1;
+			}
+			return;
+		}
+
+		/* Retransmitted SYN-ACK (same responder ISN) is server-side RTO. Keep
+		 * the earliest copy as the baseline; the responder leg is dropped below
+		 * (Karn) so only the counter reports the loss. */
+		if (seq == hs->synack_seq) {
+			if (ts < hs->synack_ts_ns)
+				hs->synack_ts_ns = ts;
+			if (hs->synack_retransmits < 0xFF)
+				hs->synack_retransmits++;
 		}
 		return;
 	}
 
-	if (is_ack && flow->saw_synack) {
-		if (ts > flow->synack_ts_ns)
-			flow->client_rtt_us = (__u32)((ts - flow->synack_ts_ns) / 1000ULL);
-		if (flow->saw_syn && ts > flow->syn_ts_ns)
-			flow->setup_us = (__u32)((ts - flow->syn_ts_ns) / 1000ULL);
-		flow->handshake_complete = 1;
+	if (is_ack && hs->saw_synack) {
+		if (dir != hs->syn_direction)          /* completing ACK is initiator->responder */
+			return;
+		if (ack != hs->synack_seq + 1U)        /* must acknowledge the SYN-ACK */
+			return;
+		if (sample->tcp_payload_len != 0)      /* pure ACK only; data segments excluded */
+			return;
+
+		if (!hs->synack_retransmits && ts >= hs->synack_ts_ns) {
+			hs->client_rtt_ns = ts - hs->synack_ts_ns;
+			hs->client_measured = 1;
+		}
+		if (ts >= hs->syn_ts_ns) {
+			hs->setup_ns = ts - hs->syn_ts_ns;
+			hs->setup_measured = 1;
+		}
+		hs->complete = 1;
 	}
 }
 

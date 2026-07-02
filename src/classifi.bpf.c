@@ -55,10 +55,19 @@ struct {
 	__type(value, __u64);
 } ringbuf_stats SEC(".maps");
 
+/* L4 metadata parse_flow_key() lifts out of the (already bounds-checked) L4
+ * header so the sample carries it directly and userspace need not re-parse. */
+struct l4_meta {
+	__u32 tcp_seq;          /* host order; 0 for non-TCP */
+	__u32 tcp_ack_seq;      /* host order; 0 for non-TCP */
+	__u16 tcp_payload_len;  /* L4 payload bytes; 0 for pure ACK / non-TCP */
+	__u8 tcp_flags;         /* TCP header byte 13; 0 for non-TCP */
+};
+
 static __always_inline int parse_flow_key(struct __sk_buff *skb,
                                           struct flow_key *key,
                                           __u16 *l3_offset,
-                                          __u8 *tcp_flags)
+                                          struct l4_meta *l4)
 {
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
@@ -112,14 +121,24 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 
 		if (iph->protocol == IPPROTO_TCP) {
 			struct tcphdr *tcph = data + offset;
+			__u32 tcp_hdr_len;
+			int payload;
 
 			if ((void *)tcph + sizeof(*tcph) > data_end)
 				return -1;
 
 			key->src_port = bpf_ntohs(tcph->source);
 			key->dst_port = bpf_ntohs(tcph->dest);
-			/* Flags octet at byte 13, within the just-validated header. */
-			*tcp_flags = ((const __u8 *)tcph)[13];
+			/* seq/ack/flags/payload-len all live in the just-validated header. */
+			l4->tcp_flags = ((const __u8 *)tcph)[13];
+			l4->tcp_seq = bpf_ntohl(tcph->seq);
+			l4->tcp_ack_seq = bpf_ntohl(tcph->ack_seq);
+			tcp_hdr_len = tcph->doff * 4;
+			if (tcp_hdr_len < sizeof(*tcph))
+				return -1;
+			payload = (int)bpf_ntohs(iph->tot_len) - (int)ip_hdr_len - (int)tcp_hdr_len;
+			l4->tcp_payload_len = payload < 0 ? 0 :
+					      (payload > 0xFFFF ? 0xFFFF : payload);
 		} else if (iph->protocol == IPPROTO_UDP) {
 			struct udphdr *udph = data + offset;
 
@@ -151,14 +170,24 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 
 		if (ip6h->nexthdr == IPPROTO_TCP) {
 			struct tcphdr *tcph = data + offset;
+			__u32 tcp_hdr_len;
+			int payload;
 
 			if ((void *)tcph + sizeof(*tcph) > data_end)
 				return -1;
 
 			key->src_port = bpf_ntohs(tcph->source);
 			key->dst_port = bpf_ntohs(tcph->dest);
-			/* Flags octet at byte 13, within the just-validated header. */
-			*tcp_flags = ((const __u8 *)tcph)[13];
+			/* seq/ack/flags/payload-len all live in the just-validated header. */
+			l4->tcp_flags = ((const __u8 *)tcph)[13];
+			l4->tcp_seq = bpf_ntohl(tcph->seq);
+			l4->tcp_ack_seq = bpf_ntohl(tcph->ack_seq);
+			tcp_hdr_len = tcph->doff * 4;
+			if (tcp_hdr_len < sizeof(*tcph))
+				return -1;
+			payload = (int)bpf_ntohs(ip6h->payload_len) - (int)tcp_hdr_len;
+			l4->tcp_payload_len = payload < 0 ? 0 :
+					      (payload > 0xFFFF ? 0xFFFF : payload);
 		} else if (ip6h->nexthdr == IPPROTO_UDP) {
 			struct udphdr *udph = data + offset;
 
@@ -180,7 +209,7 @@ static __always_inline void sample_packet(struct __sk_buff *skb,
                                           __u8 direction,
                                           __u64 ts_ns,
                                           __u16 l3_offset,
-                                          __u8 tcp_flags)
+                                          const struct l4_meta *l4)
 {
 	struct packet_sample *sample;
 	__u32 len;
@@ -212,7 +241,10 @@ static __always_inline void sample_packet(struct __sk_buff *skb,
 	sample->ifindex = skb->ifindex;
 	sample->l3_offset = l3_offset;
 	sample->direction = direction;
-	sample->tcp_flags = tcp_flags;
+	sample->tcp_flags = l4->tcp_flags;
+	sample->tcp_seq = l4->tcp_seq;
+	sample->tcp_ack_seq = l4->tcp_ack_seq;
+	sample->tcp_payload_len = l4->tcp_payload_len;
 	sample->data_len = len;
 
 	bpf_ringbuf_submit(sample, 0);
@@ -227,7 +259,7 @@ int classifi(struct __sk_buff *skb)
 	__u8 direction;
 	__u64 old_count;
 	__u16 l3_offset = 0;
-	__u8 tcp_flags = 0;
+	struct l4_meta l4 = {};
 
 	/*
 	 * Headers only; larger pulls collapse FRAGLIST-GRO chains downstream.
@@ -239,7 +271,7 @@ int classifi(struct __sk_buff *skb)
 	if (bpf_skb_pull_data(skb, pull_len) < 0)
 		return TC_ACT_OK;
 
-	if (parse_flow_key(skb, &key, &l3_offset, &tcp_flags) < 0)
+	if (parse_flow_key(skb, &key, &l3_offset, &l4) < 0)
 		return TC_ACT_OK;
 
 	direction = canonicalize_flow_key(&key);
@@ -259,14 +291,14 @@ int classifi(struct __sk_buff *skb)
 				__sync_fetch_and_add(count, 1);
 			return TC_ACT_OK;
 		}
-		sample_packet(skb, &key, direction, now, l3_offset, tcp_flags);
+		sample_packet(skb, &key, direction, now, l3_offset, &l4);
 	} else {
 		old_count = __sync_fetch_and_add(&info->packets, 1);
 		__sync_fetch_and_add(&info->bytes, skb->len);
 		info->last_seen = now;
 
 		if (info->state == FLOW_STATE_NEW && old_count < PACKETS_TO_SAMPLE) {
-			sample_packet(skb, &key, direction, now, l3_offset, tcp_flags);
+			sample_packet(skb, &key, direction, now, l3_offset, &l4);
 
 			if (old_count + 1 >= PACKETS_TO_SAMPLE)
 				info->state = FLOW_STATE_SAMPLED;

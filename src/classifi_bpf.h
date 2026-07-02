@@ -67,11 +67,14 @@ struct packet_sample {
 	__u64 ts_ns;
 	__u32 data_len;
 	__u32 ifindex;
+	__u32 tcp_seq;          /* host order; 0 for non-TCP */
+	__u32 tcp_ack_seq;      /* host order; 0 for non-TCP */
 	__u16 l3_offset;
+	__u16 tcp_payload_len;  /* L4 payload bytes; 0 for pure ACK / non-TCP */
 	__u8 direction;
 	/* Raw on-wire TCP flags octet (TCP header byte 13: FIN/SYN/RST/PSH/
-	 * ACK/URG/ECE/CWR); 0 for non-TCP. Exposed here so userspace reads
-	 * handshake flags without re-parsing the captured packet bytes. */
+	 * ACK/URG/ECE/CWR); 0 for non-TCP. Lifted here, with seq/ack/payload_len
+	 * above, so userspace tracks the handshake without re-parsing the bytes. */
 	__u8 tcp_flags;
 	__u8 data[MAX_PACKET_SAMPLE];
 } __attribute__((packed));
