@@ -275,6 +275,11 @@ void flow_process_ndpi_result(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			      const struct flow_key *packet_view,
 			      const unsigned char *l3_data, unsigned int l3_len,
 			      const char *ifname);
+void flow_ndpi_feed(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+		    const struct flow_key *packet_view,
+		    const unsigned char *l3_data, unsigned int l3_len,
+		    u_int64_t time_ms, const char *ifname,
+		    __u16 gso_size, __u16 gso_segs);
 
 struct interface_info *interface_by_name(struct classifi_ctx *ctx, const char *name);
 int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,

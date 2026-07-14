@@ -170,7 +170,6 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 	unsigned int l3_len = 0;
 	__u8 direction;
 	struct ndpi_flow *flow;
-	ndpi_protocol protocol;
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
 	static unsigned long long total_packets = 0;
 
@@ -225,14 +224,8 @@ static void pcap_packet_handler(unsigned char *user, const struct pcap_pkthdr *p
 
 	u_int64_t time_ms = pkthdr->ts.tv_sec * 1000ULL + pkthdr->ts.tv_usec / 1000ULL;
 
-	flow->input_info.in_pkt_dir = NDPI_IN_PKT_DIR_UNKNOWN;
-
-	protocol = ndpi_detection_process_packet(
-		ctx->ndpi, flow->flow, l3_data, l3_len,
-		time_ms, &flow->input_info);
-
-	flow_process_ndpi_result(ctx, flow, &protocol, &packet_view, l3_data, l3_len,
-				 ctx->pcap_ifname);
+	flow_ndpi_feed(ctx, flow, &packet_view, l3_data, l3_len, time_ms,
+		       ctx->pcap_ifname, 0, 0);
 }
 
 int run_pcap_mode(struct classifi_ctx *ctx, const char *ifname)

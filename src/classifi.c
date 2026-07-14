@@ -1634,10 +1634,311 @@ static void flow_track_handshake(struct ndpi_flow *flow,
 	}
 }
 
+struct udp_dgram {
+	unsigned int hdr_len;
+	unsigned int payload_len;
+	int truncated;
+};
+
+static int udp_dgram_parse(const unsigned char *l3_data, unsigned int l3_len,
+			   struct udp_dgram *dg)
+{
+	unsigned int ihl, udp_off, udp_len;
+
+	if (l3_len < 28)
+		return -1;
+
+	switch (l3_data[0] >> 4) {
+	case 4:
+		ihl = (l3_data[0] & 0x0F) * 4;
+		if (ihl < 20 || l3_len < ihl + 8)
+			return -1;
+		if (l3_data[9] != IPPROTO_UDP)
+			return -1;
+		if ((l3_data[6] & 0x3F) || l3_data[7])
+			return -1;
+		udp_off = ihl;
+		break;
+	case 6:
+		if (l3_len < 40 + 8 || l3_data[6] != IPPROTO_UDP)
+			return -1;
+		udp_off = 40;
+		break;
+	default:
+		return -1;
+	}
+
+	udp_len = (l3_data[udp_off + 4] << 8) | l3_data[udp_off + 5];
+	if (udp_len < 8)
+		return -1;
+
+	dg->hdr_len = udp_off + 8;
+	dg->payload_len = udp_len - 8;
+	dg->truncated = dg->payload_len > l3_len - dg->hdr_len;
+	if (dg->truncated)
+		dg->payload_len = l3_len - dg->hdr_len;
+
+	return dg->payload_len ? 0 : -1;
+}
+
+static void udp_dgram_len_patch(unsigned char *pkt, unsigned int hdr_len,
+				size_t payload_len)
+{
+	unsigned int udp_off = hdr_len - 8;
+	__u16 len;
+
+	if (pkt[0] >> 4 == 4) {
+		len = hdr_len + payload_len;
+		pkt[2] = len >> 8;
+		pkt[3] = len & 0xFF;
+	} else {
+		len = 8 + payload_len;
+		pkt[4] = len >> 8;
+		pkt[5] = len & 0xFF;
+	}
+
+	len = 8 + payload_len;
+	pkt[udp_off + 4] = len >> 8;
+	pkt[udp_off + 5] = len & 0xFF;
+}
+
+static int quic_varint_read(const unsigned char *buf, size_t len,
+			    uint64_t *value)
+{
+	size_t vlen, i;
+
+	if (!len)
+		return -1;
+
+	vlen = (size_t)1 << (buf[0] >> 6);
+	if (vlen > len)
+		return -1;
+
+	*value = buf[0] & 0x3F;
+	for (i = 1; i < vlen; i++)
+		*value = (*value << 8) | buf[i];
+
+	return vlen;
+}
+
+#define QUIC_VERSION_1 0x00000001u
+#define QUIC_VERSION_2 0x6b3343cfu
+#define QUIC_CID_MAX 20
+
+/*
+ * Byte length of the QUIC long-header packet at p, or 0 when the remainder
+ * cannot be walked (short header, Retry without a Length field, unknown
+ * version, malformed bounds). Length covers packet number + payload only,
+ * so the packet ends after the Length varint plus its value (RFC 9000
+ * 17.2); QUIC v2 remaps the long-header type bits (RFC 9369 3.2).
+ */
+static size_t quic_packet_len(const unsigned char *p, size_t len)
+{
+	uint64_t token_len, payload_len;
+	uint32_t version;
+	size_t off, cid_len;
+	int vlen, initial, retry;
+	__u8 type;
+
+	if (len < 7 || (p[0] & 0xC0) != 0xC0)
+		return 0;
+
+	version = ((uint32_t)p[1] << 24) | ((uint32_t)p[2] << 16) |
+		  ((uint32_t)p[3] << 8) | p[4];
+	if (version != QUIC_VERSION_1 && version != QUIC_VERSION_2)
+		return 0;
+
+	type = (p[0] >> 4) & 3;
+	initial = version == QUIC_VERSION_1 ? type == 0 : type == 1;
+	retry = version == QUIC_VERSION_1 ? type == 3 : type == 0;
+	if (retry)
+		return 0;
+
+	off = 5;
+	cid_len = p[off];
+	if (cid_len > QUIC_CID_MAX || len - off < 1 + cid_len + 1)
+		return 0;
+	off += 1 + cid_len;
+
+	cid_len = p[off];
+	if (cid_len > QUIC_CID_MAX || len - off < 1 + cid_len)
+		return 0;
+	off += 1 + cid_len;
+
+	if (initial) {
+		vlen = quic_varint_read(p + off, len - off, &token_len);
+		if (vlen < 0)
+			return 0;
+		off += vlen;
+		if (token_len > len - off)
+			return 0;
+		off += token_len;
+	}
+
+	vlen = quic_varint_read(p + off, len - off, &payload_len);
+	if (vlen < 0)
+		return 0;
+	off += vlen;
+	if (payload_len > len - off)
+		return 0;
+
+	return off + payload_len;
+}
+
+#define GRO_SPLIT_MAX_SEGS 8
+/* No wire UDP datagram exceeds this; larger ones are GRO aggregates. Legal
+ * sender-coalesced QUIC datagrams (e.g. sub-1200B Initial + Handshake) stay
+ * below it and must reach nDPI unsplit: it rejects Initials in datagrams
+ * shorter than 1200B. */
+#define GRO_SPLIT_MIN_PAYLOAD 1500
+#define QUIC_INITIAL_DGRAM_MIN 1200
+
+/*
+ * Boundaries of the wire datagrams inside a GRO-coalesced UDP payload.
+ * The kernel geometry (gso_size chunks) is authoritative when present;
+ * without it (pcap mode, replayed captures) fall back to walking QUIC
+ * long-header packets, the one UDP consumer classifi needs datagram
+ * boundaries for. Returns the segment count, or 0 to feed unsplit.
+ */
+static int udp_payload_split(const unsigned char *payload, size_t len,
+			     __u16 gso_size, __u16 gso_segs, int truncated,
+			     size_t *seg_len)
+{
+	size_t off, seg;
+	int count = 0, i;
+
+	/* The size*segs bounds hold for fraglist/L4 UDP GRO (only the last
+	 * segment may be shorter) but not for tunnel GRO, where gso_size
+	 * describes inner segments and slicing the outer payload with it
+	 * would be wrong. A truncated capture legitimately misses the tail,
+	 * so only the upper bound can be enforced then. */
+	if (gso_segs > 1 && gso_size > 0 && gso_size < len &&
+	    (size_t)gso_size * gso_segs >= len &&
+	    (truncated || (size_t)gso_size * (gso_segs - 1) < len)) {
+		for (off = 0; off < len && count < GRO_SPLIT_MAX_SEGS - 1; off += seg) {
+			seg = len - off < gso_size ? len - off : gso_size;
+			seg_len[count++] = seg;
+		}
+		if (off < len)
+			seg_len[count++] = len - off;
+		return count;
+	}
+
+	if (len <= GRO_SPLIT_MIN_PAYLOAD)
+		return 0;
+
+	seg = quic_packet_len(payload, len);
+	if (!seg || seg >= len)
+		return 0;
+
+	seg_len[count++] = seg;
+	off = seg;
+	while (off < len && count < GRO_SPLIT_MAX_SEGS - 1) {
+		seg = quic_packet_len(payload + off, len - off);
+		if (!seg)
+			break;
+		seg_len[count++] = seg;
+		off += seg;
+	}
+	if (off < len)
+		seg_len[count++] = len - off;
+
+	/* QUIC packet boundaries are not always datagram boundaries: a wire
+	 * datagram may legally coalesce several QUIC packets (RFC 9000 12.2)
+	 * and carving a sub-1200B Initial out of it would make nDPI reject
+	 * what it previously accepted. Client Initial datagrams are at least
+	 * 1200B, so only a split where every segment could be a datagram of
+	 * its own is trustworthy. */
+	for (i = 0; i < count; i++) {
+		if (seg_len[i] < QUIC_INITIAL_DGRAM_MIN)
+			return 0;
+	}
+
+	return count;
+}
+
+static void flow_ndpi_feed_one(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+			       const struct flow_key *packet_view,
+			       const unsigned char *l3_data, unsigned int l3_len,
+			       u_int64_t time_ms, const char *ifname)
+{
+	ndpi_protocol protocol;
+
+	flow->input_info.in_pkt_dir = NDPI_IN_PKT_DIR_UNKNOWN;
+
+	protocol = ndpi_detection_process_packet(
+		ctx->ndpi, flow->flow, l3_data, l3_len,
+		time_ms, &flow->input_info);
+
+	if (ctx->verbose && ctx->flow_map_fd >= 0 && flow->packets_processed <= 10) {
+		char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
+
+		flow_key_to_strings(packet_view, src_ip, sizeof(src_ip),
+				    dst_ip, sizeof(dst_ip));
+		log_ndpi_direction_debug(flow, packet_view,
+					 (unsigned char *)l3_data, l3_len,
+					 src_ip, dst_ip);
+	}
+
+	flow_process_ndpi_result(ctx, flow, &protocol, packet_view,
+				 l3_data, l3_len, ifname);
+}
+
+void flow_ndpi_feed(struct classifi_ctx *ctx, struct ndpi_flow *flow,
+		    const struct flow_key *packet_view,
+		    const unsigned char *l3_data, unsigned int l3_len,
+		    u_int64_t time_ms, const char *ifname,
+		    __u16 gso_size, __u16 gso_segs)
+{
+	static unsigned char seg_buf[60 + 8 + MAX_PACKET_SAMPLE];
+	size_t seg_len[GRO_SPLIT_MAX_SEGS];
+	struct udp_dgram dg;
+	const unsigned char *payload;
+	size_t off = 0;
+	int count, i;
+
+	if (packet_view->protocol != IPPROTO_UDP ||
+	    udp_dgram_parse(l3_data, l3_len, &dg) < 0 ||
+	    dg.hdr_len + dg.payload_len > sizeof(seg_buf)) {
+		flow_ndpi_feed_one(ctx, flow, packet_view, l3_data, l3_len,
+				   time_ms, ifname);
+		return;
+	}
+
+	payload = l3_data + dg.hdr_len;
+	count = udp_payload_split(payload, dg.payload_len,
+				  gso_size, gso_segs, dg.truncated, seg_len);
+	if (count < 2) {
+		flow_ndpi_feed_one(ctx, flow, packet_view, l3_data, l3_len,
+				   time_ms, ifname);
+		return;
+	}
+
+	if (ctx->verbose)
+		fprintf(stderr, "  splitting coalesced UDP datagram: %u bytes -> %d segments\n",
+			dg.payload_len, count);
+
+	memcpy(seg_buf, l3_data, dg.hdr_len);
+	for (i = 0; i < count; i++) {
+		if (!flow->flow || flow->kernel_sampling_stopped)
+			break;
+		/* The clamped capture cut the final segment short; feeding
+		 * the stub as a complete datagram would hand nDPI a packet
+		 * that never existed. */
+		if (dg.truncated && i == count - 1)
+			break;
+
+		udp_dgram_len_patch(seg_buf, dg.hdr_len, seg_len[i]);
+		memcpy(seg_buf + dg.hdr_len, payload + off, seg_len[i]);
+		flow_ndpi_feed_one(ctx, flow, packet_view, seg_buf,
+				   dg.hdr_len + seg_len[i], time_ms, ifname);
+		off += seg_len[i];
+	}
+}
+
 static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *sample)
 {
 	struct ndpi_flow *flow;
-	ndpi_protocol protocol;
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
 	struct flow_key packet_view;
 	static int total_samples = 0;
@@ -1719,18 +2020,8 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 
 	u_int64_t time_ms = sample->ts_ns ? sample->ts_ns / 1000000ULL : now_sec * 1000ULL;
 
-	flow->input_info.in_pkt_dir = NDPI_IN_PKT_DIR_UNKNOWN;
-
-	protocol = ndpi_detection_process_packet(
-		ctx->ndpi, flow->flow, ip_packet, ip_packet_len,
-		time_ms, &flow->input_info);
-
-	if (ctx->verbose && flow->packets_processed <= 10)
-		log_ndpi_direction_debug(flow, &packet_view, ip_packet, ip_packet_len,
-					 src_ip, dst_ip);
-
-	flow_process_ndpi_result(ctx, flow, &protocol, &packet_view, ip_packet, ip_packet_len,
-				 ifname);
+	flow_ndpi_feed(ctx, flow, &packet_view, ip_packet, ip_packet_len,
+		       time_ms, ifname, sample->gso_size, sample->gso_segs);
 }
 
 static int handle_sample(void *ctx, void *data, size_t len)

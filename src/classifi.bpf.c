@@ -270,6 +270,8 @@ static __always_inline void sample_packet(struct __sk_buff *skb,
 	sample->tcp_seq = l4->tcp_seq;
 	sample->tcp_ack_seq = l4->tcp_ack_seq;
 	sample->tcp_payload_len = l4->tcp_payload_len;
+	sample->gso_size = skb->gso_size;
+	sample->gso_segs = skb->gso_segs;
 	sample->data_len = len;
 
 	size = offsetof(struct packet_sample, data) + len;

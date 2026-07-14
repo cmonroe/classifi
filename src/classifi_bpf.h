@@ -82,6 +82,13 @@ struct packet_sample {
 	__u32 tcp_ack_seq;      /* host order; 0 for non-TCP */
 	__u16 l3_offset;
 	__u16 tcp_payload_len;  /* L4 payload bytes; 0 for pure ACK / non-TCP */
+	/* GRO aggregation geometry from skb_shared_info: gso_segs original
+	 * packets of gso_size L4 payload bytes each (last may be shorter).
+	 * Userspace needs both to split a fraglist-GRO'd UDP datagram back
+	 * into the wire datagrams before nDPI sees it; QUIC places semantic
+	 * boundaries at datagrams, unlike TCP's byte stream. */
+	__u16 gso_size;
+	__u16 gso_segs;
 	__u8 direction;
 	/* Raw on-wire TCP flags octet (TCP header byte 13: FIN/SYN/RST/PSH/
 	 * ACK/URG/ECE/CWR); 0 for non-TCP. Lifted here, with seq/ack/payload_len
