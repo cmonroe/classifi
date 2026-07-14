@@ -555,6 +555,8 @@ void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 		blobmsg_add_string(&b, "ja4_client", flow->ja4_client);
 	if (flow->ndpi_fingerprint[0])
 		blobmsg_add_string(&b, "ndpi_fingerprint", flow->ndpi_fingerprint);
+	if (flow->ndpi_server_fingerprint[0])
+		blobmsg_add_string(&b, "ndpi_server_fingerprint", flow->ndpi_server_fingerprint);
 	if (flow->detection_method[0])
 		blobmsg_add_string(&b, "detection_method", flow->detection_method);
 	if (flow_hostname(flow)[0])
@@ -997,9 +999,14 @@ void flow_update_metadata(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 			snprintf(flow->ja4_client, sizeof(flow->ja4_client), "%s", ja4_client);
 	}
 
-	if (flow->flow->ndpi.fingerprint && !flow->ndpi_fingerprint[0])
+	if (flow->flow->ndpi.client_fingerprint && !flow->ndpi_fingerprint[0])
 		snprintf(flow->ndpi_fingerprint, sizeof(flow->ndpi_fingerprint), "%s",
-			 flow->flow->ndpi.fingerprint);
+			 flow->flow->ndpi.client_fingerprint);
+
+	if (flow->flow->ndpi.server_fingerprint && !flow->ndpi_server_fingerprint[0])
+		snprintf(flow->ndpi_server_fingerprint,
+			 sizeof(flow->ndpi_server_fingerprint), "%s",
+			 flow->flow->ndpi.server_fingerprint);
 
 	if (protocol->protocol_stack.protos_num > 0 && flow->protocol_stack_count == 0) {
 		stack_count = protocol->protocol_stack.protos_num;
@@ -1414,6 +1421,7 @@ static struct ndpi_detection_module_struct *setup_ndpi(void)
 
 	ndpi_config_set(ndpi_struct, NULL, "metadata.ndpi_fingerprint", "enable");
 	ndpi_config_set(ndpi_struct, NULL, "metadata.ndpi_fingerprint_format", "1");
+	ndpi_config_set(ndpi_struct, NULL, "metadata.ndpi_server_fingerprint", "enable");
 
 	/*
 	 * Disabled for now: nDPI's ja4 custom rules (from protos.txt) overwrite

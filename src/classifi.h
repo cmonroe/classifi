@@ -148,6 +148,7 @@ struct ndpi_flow {
 	char os_hint[32];
 	char ja4_fingerprint[40];
 	char ndpi_fingerprint[36];
+	char ndpi_server_fingerprint[16];
 	char ja4_client[64];
 	char detection_method[32];
 	char src_country[4];

@@ -426,6 +426,8 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 		blobmsg_add_string(b, "ja4_client", flow->ja4_client);
 	if (flow->ndpi_fingerprint[0])
 		blobmsg_add_string(b, "ndpi_fingerprint", flow->ndpi_fingerprint);
+	if (flow->ndpi_server_fingerprint[0])
+		blobmsg_add_string(b, "ndpi_server_fingerprint", flow->ndpi_server_fingerprint);
 	if (flow->detection_method[0])
 		blobmsg_add_string(b, "detection_method", flow->detection_method);
 	if (flow_hostname(flow)[0])
