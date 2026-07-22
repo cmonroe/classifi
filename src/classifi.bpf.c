@@ -177,21 +177,37 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 
 	if (h_proto == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6h = data + offset;
+		struct ipv6_eh eh;
 
 		if ((void *)ip6h + sizeof(*ip6h) > data_end)
 			return PARSE_SHORT;
 
 		key->family = FLOW_FAMILY_IPV6;
-		key->protocol = ip6h->nexthdr;
 		key->src_port = 0;
 		key->dst_port = 0;
 		__builtin_memcpy(&key->src, &ip6h->saddr, sizeof(struct in6_addr));
 		__builtin_memcpy(&key->dst, &ip6h->daddr, sizeof(struct in6_addr));
 
 		*l3_offset = offset;
-		offset += sizeof(*ip6h);
 
-		if (ip6h->nexthdr == IPPROTO_TCP) {
+		/* protocol is set before the SHORT return so a chain longer
+		 * than the pull still yields a usable (ports-zero) key. */
+		if (ipv6_eh_walk((const __u8 *)(ip6h + 1), data_end,
+				 bpf_ntohs(ip6h->payload_len),
+				 ip6h->nexthdr, &eh)) {
+			key->protocol = eh.protocol;
+			return PARSE_SHORT;
+		}
+
+		key->protocol = eh.protocol;
+		if (!eh.l4_ok)
+			return 0;
+
+		/* mask keeps the verifier's offset bound if eh.len loses its
+		 * range through a stack spill; true max is 6 * 2048 = 12288 */
+		offset += sizeof(*ip6h) + (eh.len & 0x3FFF);
+
+		if (eh.protocol == IPPROTO_TCP) {
 			struct tcphdr *tcph = data + offset;
 			__u32 tcp_hdr_len;
 			int payload;
@@ -208,10 +224,16 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 			tcp_hdr_len = tcph->doff * 4;
 			if (tcp_hdr_len < sizeof(*tcph))
 				return PARSE_ERR;
-			payload = (int)bpf_ntohs(ip6h->payload_len) - (int)tcp_hdr_len;
+			payload = (int)bpf_ntohs(ip6h->payload_len) -
+				  (int)eh.len - (int)tcp_hdr_len;
 			l4->tcp_payload_len = payload < 0 ? 0 :
 					      (payload > 0xFFFF ? 0xFFFF : payload);
-		} else if (ip6h->nexthdr == IPPROTO_UDP) {
+			/* a first fragment ending right after the TCP header
+			 * carries its payload in later fragments (M=1), so it
+			 * must not read as a pure ACK to handshake tracking */
+			if (eh.frag_more && l4->tcp_payload_len == 0)
+				l4->tcp_payload_len = 1;
+		} else if (eh.protocol == IPPROTO_UDP) {
 			struct udphdr *udph = data + offset;
 
 			if ((void *)udph + sizeof(*udph) > data_end)
@@ -299,20 +321,28 @@ int classifi(struct __sk_buff *skb)
 	 * parse directly and pull only on demand: bpf_skb_pull_data() forces
 	 * the skb writable, which unclones every cloned skb it touches.
 	 * Headers only; larger pulls collapse FRAGLIST-GRO chains downstream.
+	 * 256 covers the full header stack incl. realistic IPv6 extension
+	 * chains (eth 14 + 2 VLANs 8 + IPv6 40 + ~100 EH + TCP 60); 128 was
+	 * already marginal with zero EHs.
 	 * Clamp to skb->len: bpf_skb_pull_data() fails when asked for more
-	 * bytes than the packet holds, which would drop every sub-128B packet
+	 * bytes than the packet holds, which would drop every short packet
 	 * (TCP SYN/SYN-ACK/ACK, small DNS queries) before it can be
 	 * tracked/sampled.
 	 */
 	ret = parse_flow_key(skb, &key, &l3_offset, &l4);
 	if (ret == PARSE_SHORT) {
-		__u32 pull_len = skb->len < 128 ? skb->len : 128;
+		__u32 pull_len = skb->len < 256 ? skb->len : 256;
 
 		if (bpf_skb_pull_data(skb, pull_len) < 0)
 			return TC_ACT_OK;
 
 		ret = parse_flow_key(skb, &key, &l3_offset, &l4);
 	}
+	/* an IPv6 extension chain longer than the pull cannot be completed
+	 * by pulling more; track the flow with ports zero instead of losing
+	 * it. IPv4 headers always fit the pull, so v4 SHORT stays a drop. */
+	if (ret == PARSE_SHORT && key.family == FLOW_FAMILY_IPV6)
+		ret = 0;
 	if (ret < 0)
 		return TC_ACT_OK;
 

@@ -672,12 +672,19 @@ static const void *l4_hdr_locate(const struct packet_sample *sample,
 		ip_hdr_len = iph->ihl * 4;
 	} else if (sample->key.family == FLOW_FAMILY_IPV6) {
 		const struct ipv6hdr *ip6h = (const struct ipv6hdr *)ip_packet;
+		struct ipv6_eh eh;
 
 		if (l3_offset + sizeof(struct ipv6hdr) > sample->data_len)
 			return NULL;
 
-		protocol = ip6h->nexthdr;
-		ip_hdr_len = sizeof(struct ipv6hdr);
+		ipv6_eh_walk(ip_packet + sizeof(struct ipv6hdr),
+			     sample->data + sample->data_len,
+			     ntohs(ip6h->payload_len), ip6h->nexthdr, &eh);
+		if (!eh.l4_ok)
+			return NULL;
+
+		protocol = eh.protocol;
+		ip_hdr_len = sizeof(struct ipv6hdr) + eh.len;
 	} else {
 		return NULL;
 	}
@@ -965,7 +972,18 @@ static const unsigned char *dns_payload_extract(const unsigned char *l3_data,
 		unsigned int ip_hdr_len = iph->ihl * 4;
 		offset = ip_hdr_len + 8;
 	} else {
-		offset = 40 + 8;
+		const struct ipv6hdr *ip6h = (const struct ipv6hdr *)l3_data;
+		struct ipv6_eh eh;
+
+		if (l3_len < sizeof(struct ipv6hdr))
+			return NULL;
+
+		ipv6_eh_walk(l3_data + sizeof(struct ipv6hdr), l3_data + l3_len,
+			     ntohs(ip6h->payload_len), ip6h->nexthdr, &eh);
+		if (!eh.l4_ok || eh.protocol != IPPROTO_UDP)
+			return NULL;
+
+		offset = sizeof(struct ipv6hdr) + eh.len + 8;
 	}
 
 	if (offset >= l3_len)
@@ -1483,7 +1501,6 @@ static void log_ndpi_direction_debug(struct ndpi_flow *flow, const struct flow_k
 	unsigned int ip_hdr_len, tcp_hdr_len, payload_off, payload_len;
 	const uint8_t *payload;
 	struct tcphdr *tcph;
-	struct iphdr *iph;
 
 	fprintf(stderr, "  [nDPI DIR] %s -> %s pkt_dir_counter[0]=%u [1]=%u client_dir=%u input_dir=%u pkt_dir=%u\n",
 		src_ip, dst_ip,
@@ -1497,8 +1514,29 @@ static void log_ndpi_direction_debug(struct ndpi_flow *flow, const struct flow_k
 	    packet_view->protocol != IPPROTO_TCP)
 		return;
 
-	iph = (struct iphdr *)ip_packet;
-	ip_hdr_len = iph->ihl * 4;
+	if (packet_view->family == FLOW_FAMILY_IPV4) {
+		struct iphdr *iph = (struct iphdr *)ip_packet;
+
+		if (ip_packet_len < sizeof(struct iphdr))
+			return;
+		ip_hdr_len = iph->ihl * 4;
+	} else {
+		struct ipv6hdr *ip6h = (struct ipv6hdr *)ip_packet;
+		struct ipv6_eh eh;
+
+		if (ip_packet_len < sizeof(struct ipv6hdr))
+			return;
+		ipv6_eh_walk(ip_packet + sizeof(struct ipv6hdr),
+			     ip_packet + ip_packet_len,
+			     ntohs(ip6h->payload_len), ip6h->nexthdr, &eh);
+		if (!eh.l4_ok || eh.protocol != IPPROTO_TCP)
+			return;
+		ip_hdr_len = sizeof(struct ipv6hdr) + eh.len;
+	}
+
+	if (ip_hdr_len + sizeof(struct tcphdr) > ip_packet_len)
+		return;
+
 	tcph = (struct tcphdr *)(ip_packet + ip_hdr_len);
 	tcp_hdr_len = tcph->doff * 4;
 	payload_off = ip_hdr_len + tcp_hdr_len;
@@ -1667,11 +1705,21 @@ static int udp_dgram_parse(const unsigned char *l3_data, unsigned int l3_len,
 			return -1;
 		udp_off = ihl;
 		break;
-	case 6:
-		if (l3_len < 40 + 8 || l3_data[6] != IPPROTO_UDP)
+	case 6: {
+		struct ipv6_eh eh;
+
+		if (l3_len < 40)
 			return -1;
-		udp_off = 40;
+		ipv6_eh_walk(l3_data + 40, l3_data + l3_len,
+			     ((__u32)l3_data[4] << 8) | l3_data[5],
+			     l3_data[6], &eh);
+		if (!eh.l4_ok || eh.frag || eh.protocol != IPPROTO_UDP)
+			return -1;
+		udp_off = 40 + eh.len;
+		if (l3_len < udp_off + 8)
+			return -1;
 		break;
+	}
 	default:
 		return -1;
 	}
@@ -1700,7 +1748,7 @@ static void udp_dgram_len_patch(unsigned char *pkt, unsigned int hdr_len,
 		pkt[2] = len >> 8;
 		pkt[3] = len & 0xFF;
 	} else {
-		len = 8 + payload_len;
+		len = hdr_len - 40 + payload_len;
 		pkt[4] = len >> 8;
 		pkt[5] = len & 0xFF;
 	}

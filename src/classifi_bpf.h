@@ -16,12 +16,29 @@
 
 #include <linux/types.h>
 
+#ifdef __BPF__
+#include <linux/in.h>
+#include <linux/in6.h>
+#else
+#include <netinet/in.h>
+#endif
+
 #ifndef offsetof
 #define offsetof(TYPE, MEMBER) __builtin_offsetof(TYPE, MEMBER)
 #endif
 
 #ifndef IP_OFFSET
 #define IP_OFFSET 0x1FFF
+#endif
+
+#ifndef IPPROTO_MH
+#define IPPROTO_MH 135
+#endif
+#ifndef IPPROTO_HIP
+#define IPPROTO_HIP 139
+#endif
+#ifndef IPPROTO_SHIM6
+#define IPPROTO_SHIM6 140
 #endif
 
 #define MAX_FLOWS 8192
@@ -99,8 +116,10 @@ struct packet_sample {
 
 #ifdef __BPF__
 #define FLOW_INLINE static __always_inline
+#define FLOW_UNROLL _Pragma("unroll")
 #else
 #define FLOW_INLINE static inline
+#define FLOW_UNROLL
 #endif
 
 FLOW_INLINE void swap_flow_endpoints(struct flow_key *key)
@@ -149,6 +168,132 @@ FLOW_INLINE __u8 canonicalize_flow_key(struct flow_key *key)
 		swap_flow_endpoints(key);
 
 	return swapped;
+}
+
+/* RFC 8200 4.1 recommends at most 6 extension headers before the upper
+ * layer (HBH, DSTOPT, RT, FRAG, AH, DSTOPT); deeper chains give up */
+#define IPV6_EH_MAX 6
+#define IPV6_EH_SHORT -2
+
+struct ipv6_eh {
+	__u16 len;
+	__u8 protocol;
+	__u8 l4_ok;
+	__u8 frag;
+	__u8 frag_more;
+};
+
+FLOW_INLINE int ipv6_eh_skippable(__u8 nexthdr)
+{
+	switch (nexthdr) {
+	case IPPROTO_HOPOPTS:
+	case IPPROTO_ROUTING:
+	case IPPROTO_FRAGMENT:
+	case IPPROTO_AH:
+	case IPPROTO_DSTOPTS:
+	case IPPROTO_MH:
+	case IPPROTO_HIP:
+	case IPPROTO_SHIM6:
+		return 1;
+	}
+	return 0;
+}
+
+FLOW_INLINE void ipv6_eh_finish(struct ipv6_eh *out, __u8 nexthdr, __u32 len,
+				__u32 payload_limit)
+{
+	__u32 l4_min = 0;
+
+	if (nexthdr == IPPROTO_TCP)
+		l4_min = 20;
+	else if (nexthdr == IPPROTO_UDP)
+		l4_min = 8;
+
+	out->protocol = nexthdr;
+	out->len = len;
+	/* ESP hides the transport header behind the SA; NONE has none. The
+	 * payload_limit test rejects L4 headers that would extend past the
+	 * IP payload into Ethernet min-frame padding the capture includes. */
+	out->l4_ok = nexthdr != IPPROTO_ESP && nexthdr != IPPROTO_NONE &&
+		     len + l4_min <= payload_limit;
+}
+
+/*
+ * Walk the IPv6 extension-header chain to the upper-layer protocol.
+ * eh points at the byte after the fixed 40-byte header; payload_limit is
+ * ntohs(payload_len) and bounds the walk logically even when the capture
+ * (data_end) extends further. Returns 0 with *out filled, or
+ * IPV6_EH_SHORT when the chain runs past data_end (a larger capture
+ * could complete it; *out is still filled with the progress made).
+ */
+FLOW_INLINE int ipv6_eh_walk(const __u8 *eh, const void *data_end,
+			     __u32 payload_limit, __u8 nexthdr,
+			     struct ipv6_eh *out)
+{
+	__u32 len = 0;
+	__u32 ext_len;
+	int i;
+
+	out->frag = 0;
+	out->frag_more = 0;
+
+	FLOW_UNROLL
+	for (i = 0; i < IPV6_EH_MAX; i++) {
+		if (!ipv6_eh_skippable(nexthdr)) {
+			ipv6_eh_finish(out, nexthdr, len, payload_limit);
+			return 0;
+		}
+
+		/* every EH is at least 8 bytes on the wire, so one uniform
+		 * check covers the nexthdr/len and fragment-field reads */
+		if ((const void *)(eh + 8) > data_end) {
+			out->protocol = nexthdr;
+			out->len = len;
+			out->l4_ok = 0;
+			return IPV6_EH_SHORT;
+		}
+
+		if (len + 8 > payload_limit)
+			goto giveup;
+
+		if (nexthdr == IPPROTO_FRAGMENT) {
+			out->frag = 1;
+			/* RFC 8200 4.5: Next Header names the first header of
+			 * the fragmentable part in every fragment, but only
+			 * the first fragment (offset 0) carries those bytes */
+			if ((((__u32)eh[2] << 8) | eh[3]) & 0xFFF8) {
+				out->protocol = eh[0];
+				out->len = len + 8;
+				out->l4_ok = 0;
+				return 0;
+			}
+			out->frag_more = eh[3] & 0x01;
+			ext_len = 8;
+		} else if (nexthdr == IPPROTO_AH) {
+			/* RFC 4302 2.2: AH length is in 4-byte units */
+			ext_len = ((__u32)eh[1] + 2) * 4;
+		} else {
+			ext_len = ((__u32)eh[1] + 1) * 8;
+		}
+
+		if (len + ext_len > payload_limit)
+			goto giveup;
+
+		nexthdr = eh[0];
+		eh += ext_len;
+		len += ext_len;
+	}
+
+	if (!ipv6_eh_skippable(nexthdr)) {
+		ipv6_eh_finish(out, nexthdr, len, payload_limit);
+		return 0;
+	}
+
+giveup:
+	out->protocol = nexthdr;
+	out->len = len;
+	out->l4_ok = 0;
+	return 0;
 }
 
 #endif /* CLASSIFI_BPF_H */

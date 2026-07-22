@@ -138,6 +138,7 @@ static int parse_packet_libpcap(const unsigned char *packet, int packet_len,
 
 	if (eth_type == ETH_P_IPV6) {
 		const struct ipv6hdr *ip6h;
+		struct ipv6_eh eh;
 
 		if (offset + sizeof(struct ipv6hdr) > packet_len)
 			return -1;
@@ -145,17 +146,24 @@ static int parse_packet_libpcap(const unsigned char *packet, int packet_len,
 		ip6h = (struct ipv6hdr *)ptr;
 
 		key->family = FLOW_FAMILY_IPV6;
-		key->protocol = ip6h->nexthdr;
 		memcpy(&key->src, &ip6h->saddr, sizeof(struct in6_addr));
 		memcpy(&key->dst, &ip6h->daddr, sizeof(struct in6_addr));
 
 		*l3_data = (unsigned char *)ptr;
 		*l3_len = packet_len - offset;
 
-		offset += sizeof(struct ipv6hdr);
+		/* a chain truncated by the capture degrades to ports-zero
+		 * tracking; the flow still reaches nDPI */
+		ipv6_eh_walk(ptr + sizeof(struct ipv6hdr), packet + packet_len,
+			     ntohs(ip6h->payload_len), ip6h->nexthdr, &eh);
+		key->protocol = eh.protocol;
+		if (!eh.l4_ok)
+			return 0;
+
+		offset += sizeof(struct ipv6hdr) + eh.len;
 		ptr = packet + offset;
 
-		return transport_ports_extract(ptr, offset, packet_len, ip6h->nexthdr, key);
+		return transport_ports_extract(ptr, offset, packet_len, eh.protocol, key);
 	}
 
 	return -1;
