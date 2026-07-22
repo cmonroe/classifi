@@ -96,6 +96,13 @@ struct interface_info {
 	struct flow_addr local_ip6;
 	__u8 local_ip6_set;
 	__u8 discovered;
+	/* kernel counters harvested across re-attach so totals stay
+	 * continuous per interface name, not per ifindex incarnation */
+	__u64 acc_packets;
+	__u64 acc_bytes;
+	__u64 samples;
+	__u64 flows;
+	__u32 reattaches;
 	__u32 tc_handle_ingress;
 	__u32 tc_priority_ingress;
 	__u32 tc_handle_egress;
@@ -210,6 +217,16 @@ struct classifi_ctx {
 	int ringbuf_stats_fd;
 	struct ring_buffer *ringbuf;
 
+	int iface_stats_fd;
+
+	__u64 samples_total;
+	__u64 flows_created;
+	__u64 flows_expired;
+	__u64 udp_splits;
+	__u64 events_classified;
+	__u64 events_dns;
+	__u64 events_rule;
+
 	struct uloop_fd ringbuf_uloop_fd;
 	struct uloop_fd rtnl_fd;
 	struct uloop_timeout cleanup_timer;
@@ -288,6 +305,11 @@ void flow_ndpi_feed(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 struct interface_info *interface_by_name(struct classifi_ctx *ctx, const char *name);
 int attach_tc_program(struct classifi_ctx *ctx, const char *ifname, int discovered);
 int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface);
+int interface_reattach(struct classifi_ctx *ctx, struct interface_info *iface,
+		       int ifindex);
+void interface_link_down(struct classifi_ctx *ctx, struct interface_info *iface);
+int iface_stats_read(struct classifi_ctx *ctx, int ifindex,
+		     __u64 *packets, __u64 *bytes);
 
 int ja4_table_load(struct classifi_ctx *ctx, const char *path);
 const char *ja4_table_lookup(struct classifi_ctx *ctx, const char *fingerprint);

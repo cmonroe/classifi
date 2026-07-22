@@ -280,6 +280,7 @@ struct ndpi_flow *flow_table_insert(struct classifi_ctx *ctx, struct flow_key *k
 	flow->next = ctx->flow_table[hash];
 	ctx->flow_table[hash] = flow;
 	ctx->num_flows++;
+	ctx->flows_created++;
 
 	flow_table_pressure_check(ctx, now_sec);
 
@@ -631,6 +632,7 @@ void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 
 	network_quality_to_blob(&b, flow);
 
+	ctx->events_classified++;
 	if (ubus_send_event(ctx->ubus_ctx, "classifi.classified", b.head) != 0) {
 		if (ctx->verbose)
 			fprintf(stderr, "failed to send ubus event for flow %s:%u -> %s:%u\n",
@@ -655,6 +657,7 @@ void emit_dns_event(struct classifi_ctx *ctx, const char *client_ip, const char 
 	blobmsg_add_string(&b, "domain", domain);
 	blobmsg_add_string(&b, "query_type", dns_qtype_str(qtype, qtype_buf, sizeof(qtype_buf)));
 
+	ctx->events_dns++;
 	if (ubus_send_event(ctx->ubus_ctx, "classifi.dns_query", b.head) != 0) {
 		if (ctx->verbose)
 			fprintf(stderr, "failed to send DNS event for %s -> %s\n", client_ip, domain);
@@ -798,6 +801,7 @@ static void emit_rule_match_event(struct classifi_ctx *ctx,
 		blobmsg_add_string(&b, field_name, extracts[i]);
 	}
 
+	ctx->events_rule++;
 	if (ubus_send_event(ctx->ubus_ctx, "classifi.rule_match", b.head) != 0) {
 		if (ctx->verbose)
 			fprintf(stderr, "failed to send rule match event for rule '%s'\n", rule->name);
@@ -2003,6 +2007,8 @@ void flow_ndpi_feed(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 		fprintf(stderr, "  splitting coalesced UDP datagram: %u bytes -> %d segments\n",
 			dg.payload_len, count);
 
+	ctx->udp_splits++;
+
 	memcpy(seg_buf, l3_data, dg.hdr_len);
 	for (i = 0; i < count; i++) {
 		if (!flow->flow || flow->kernel_sampling_stopped)
@@ -2026,10 +2032,14 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	struct ndpi_flow *flow;
 	char src_ip[INET6_ADDRSTRLEN], dst_ip[INET6_ADDRSTRLEN];
 	struct flow_key packet_view;
-	static int total_samples = 0;
+	struct interface_info *iface;
 	const char *ifname;
 
-	total_samples++;
+	ctx->samples_total++;
+
+	iface = interface_by_index(ctx, sample->ifindex);
+	if (iface)
+		iface->samples++;
 
 	packet_view = sample->key;
 	if (sample->direction)
@@ -2045,10 +2055,13 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	if (!flow)
 		return;
 
-	ifname = interface_name_by_index(ctx, sample->ifindex);
+	ifname = iface ? iface->name : "unknown";
 
-	if (!flow->ifindex)
+	if (!flow->ifindex) {
 		flow->ifindex = sample->ifindex;
+		if (iface)
+			iface->flows++;
+	}
 
 	src_ip[0] = dst_ip[0] = '\0';
 	if (ctx->verbose)
@@ -2066,8 +2079,9 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 		return;
 
 	if (ctx->verbose) {
-		fprintf(stderr, "sample %d (flow pkt %d, dir=%u): %s:%u -> %s:%u proto=%u len=%u l3_off=%u [dir0=%d dir1=%d]\n",
-			total_samples, flow->packets_processed, sample->direction,
+		fprintf(stderr, "sample %llu (flow pkt %d, dir=%u): %s:%u -> %s:%u proto=%u len=%u l3_off=%u [dir0=%d dir1=%d]\n",
+			(unsigned long long)ctx->samples_total,
+			flow->packets_processed, sample->direction,
 			src_ip, packet_view.src_port,
 			dst_ip, packet_view.dst_port, packet_view.protocol,
 			sample->data_len, sample->l3_offset,
@@ -2167,6 +2181,12 @@ int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface)
 		hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
 		bpf_tc_hook_destroy(&hook);
 
+		if (ctx->iface_stats_fd >= 0) {
+			__u32 stats_key = iface->ifindex;
+
+			bpf_map_delete_elem(ctx->iface_stats_fd, &stats_key);
+		}
+
 		printf("detached BPF program from %s (ifindex %d)\n", iface->name, iface->ifindex);
 	}
 
@@ -2190,6 +2210,78 @@ static void detach_tc_program(struct classifi_ctx *ctx)
 {
 	while (ctx->num_interfaces > 0)
 		detach_interface(ctx, &ctx->interfaces[0]);
+}
+
+static void iface_stats_seed(struct classifi_ctx *ctx, int ifindex)
+{
+	int ncpus = libbpf_num_possible_cpus();
+	struct iface_stat *vals;
+	__u32 key = ifindex;
+
+	if (ctx->iface_stats_fd < 0 || ncpus <= 0)
+		return;
+
+	vals = calloc(ncpus, sizeof(*vals));
+	if (!vals)
+		return;
+
+	bpf_map_update_elem(ctx->iface_stats_fd, &key, vals, BPF_ANY);
+	free(vals);
+}
+
+int iface_stats_read(struct classifi_ctx *ctx, int ifindex,
+		     __u64 *packets, __u64 *bytes)
+{
+	int ncpus = libbpf_num_possible_cpus();
+	struct iface_stat *vals;
+	__u32 key = ifindex;
+
+	*packets = 0;
+	*bytes = 0;
+
+	if (ctx->iface_stats_fd < 0 || ifindex <= 0 || ncpus <= 0)
+		return -1;
+
+	vals = calloc(ncpus, sizeof(*vals));
+	if (!vals)
+		return -1;
+
+	if (bpf_map_lookup_elem(ctx->iface_stats_fd, &key, vals) != 0) {
+		free(vals);
+		return -1;
+	}
+
+	for (int i = 0; i < ncpus; i++) {
+		*packets += vals[i].packets;
+		*bytes += vals[i].bytes;
+	}
+
+	free(vals);
+
+	return 0;
+}
+
+static void iface_stats_harvest(struct classifi_ctx *ctx, struct interface_info *iface)
+{
+	__u64 packets, bytes;
+	__u32 key = iface->ifindex;
+
+	if (!iface->ifindex)
+		return;
+
+	if (iface_stats_read(ctx, iface->ifindex, &packets, &bytes) == 0) {
+		iface->acc_packets += packets;
+		iface->acc_bytes += bytes;
+	}
+
+	if (ctx->iface_stats_fd >= 0)
+		bpf_map_delete_elem(ctx->iface_stats_fd, &key);
+}
+
+void interface_link_down(struct classifi_ctx *ctx, struct interface_info *iface)
+{
+	iface_stats_harvest(ctx, iface);
+	iface->ifindex = 0;
 }
 
 static int interface_attach(struct classifi_ctx *ctx, struct interface_info *iface,
@@ -2246,9 +2338,19 @@ static int interface_attach(struct classifi_ctx *ctx, struct interface_info *ifa
 	iface->tc_priority_ingress = opts_ingress.priority;
 	iface->tc_handle_egress = opts_egress.handle;
 	iface->tc_priority_egress = opts_egress.priority;
+	iface_stats_seed(ctx, ifindex);
 	get_interface_ip(iface);
 
 	return 0;
+}
+
+int interface_reattach(struct classifi_ctx *ctx, struct interface_info *iface,
+		       int ifindex)
+{
+	interface_link_down(ctx, iface);
+	iface->reattaches++;
+
+	return interface_attach(ctx, iface, ifindex);
 }
 
 int attach_tc_program(struct classifi_ctx *ctx, const char *ifname, int discovered)
@@ -2313,7 +2415,7 @@ static void rtnl_link_handle(struct classifi_ctx *ctx, struct nlmsghdr *nlh)
 		 * name) so the NEWLINK of a re-created device can re-attach */
 		printf("interface %s (ifindex %d) gone, waiting for re-creation\n",
 		       iface->name, iface->ifindex);
-		iface->ifindex = 0;
+		interface_link_down(ctx, iface);
 		return;
 	}
 
@@ -2328,8 +2430,7 @@ static void rtnl_link_handle(struct classifi_ctx *ctx, struct nlmsghdr *nlh)
 
 	printf("interface %s re-created (ifindex %d -> %d), re-attaching\n",
 	       ifname, iface->ifindex, ifi->ifi_index);
-	iface->ifindex = 0;
-	interface_attach(ctx, iface, ifi->ifi_index);
+	interface_reattach(ctx, iface, ifi->ifi_index);
 }
 
 static void rtnl_fd_handle(struct uloop_fd *fd, unsigned int events)
@@ -2423,6 +2524,7 @@ static void flow_free(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 		ndpi_flow_free(flow->flow);
 	free(flow);
 	ctx->num_flows--;
+	ctx->flows_expired++;
 }
 
 static const char *flow_event_ifname(struct classifi_ctx *ctx, struct ndpi_flow *flow)
@@ -2759,6 +2861,7 @@ int main(int argc, char **argv)
 	ctx.bpf_prog_fd = -1;
 	ctx.flow_map_fd = -1;
 	ctx.ringbuf_stats_fd = -1;
+	ctx.iface_stats_fd = -1;
 
 	signal(SIGCHLD, SIG_IGN);
 
@@ -2852,6 +2955,9 @@ int main(int argc, char **argv)
 		err = 1;
 		goto cleanup;
 	}
+
+	/* absent in an older BPF object; per-interface counters read zero then */
+	ctx.iface_stats_fd = bpf_object__find_map_fd_by_name(ctx.bpf_obj, "iface_stats");
 
 	ctx.bpf_prog_fd = prog_fd;
 

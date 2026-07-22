@@ -313,16 +313,23 @@ interfaces_reload(struct classifi_ctx *ctx, int *added, int *removed)
 		}
 
 		/* A recreated device (netifd bridge rebuild) gets a new ifindex
-		 * and takes the TC hooks down with the old one; detaching here
-		 * lets the add pass below re-attach under the new ifindex. */
+		 * and takes the TC hooks down with the old one; re-attach in
+		 * place so the slot keeps its counters and its name stays
+		 * matchable for the link monitor. */
 		cur_ifindex = if_nametoindex(iface->name);
 		if (cur_ifindex == (unsigned int)iface->ifindex)
 			continue;
 
+		if (!cur_ifindex) {
+			printf("interface %s gone, waiting for re-creation\n",
+			       iface->name);
+			interface_link_down(ctx, iface);
+			continue;
+		}
+
 		printf("interface %s ifindex changed (%d -> %u), re-attaching\n",
 		       iface->name, iface->ifindex, cur_ifindex);
-		detach_interface(ctx, iface);
-		(*removed)++;
+		interface_reattach(ctx, iface, cur_ifindex);
 	}
 
 	for (int i = 0; i < num_discovered; i++) {
@@ -546,14 +553,39 @@ classifi_status_handler(struct ubus_context *uctx, struct ubus_object *obj,
 		bpf_map_lookup_elem(g_ctx->ringbuf_stats_fd, &stats_key, &drops);
 	blobmsg_add_u64(&b, "ringbuf_drops", drops);
 
+	blobmsg_add_u32(&b, "flows_active", g_ctx->num_flows);
+	blobmsg_add_u64(&b, "flows_created", g_ctx->flows_created);
+	blobmsg_add_u64(&b, "flows_expired", g_ctx->flows_expired);
+	blobmsg_add_u64(&b, "samples", g_ctx->samples_total);
+	blobmsg_add_u64(&b, "udp_splits", g_ctx->udp_splits);
+
+	void *events = blobmsg_open_table(&b, "events");
+	blobmsg_add_u64(&b, "classified", g_ctx->events_classified);
+	blobmsg_add_u64(&b, "dns_query", g_ctx->events_dns);
+	blobmsg_add_u64(&b, "rule_match", g_ctx->events_rule);
+	blobmsg_close_table(&b, events);
+
 	ifaces = blobmsg_open_array(&b, "interfaces");
 	for (int i = 0; i < g_ctx->num_interfaces; i++) {
 		struct interface_info *info = &g_ctx->interfaces[i];
+		__u64 pkts, bytes, cur_pkts, cur_bytes;
 
 		iface_obj = blobmsg_open_table(&b, NULL);
 		blobmsg_add_string(&b, "name", info->name ? info->name : "");
 		blobmsg_add_u32(&b, "ifindex", info->ifindex);
 		blobmsg_add_u8(&b, "discovered", info->discovered);
+
+		pkts = info->acc_packets;
+		bytes = info->acc_bytes;
+		if (iface_stats_read(g_ctx, info->ifindex, &cur_pkts, &cur_bytes) == 0) {
+			pkts += cur_pkts;
+			bytes += cur_bytes;
+		}
+		blobmsg_add_u64(&b, "packets", pkts);
+		blobmsg_add_u64(&b, "bytes", bytes);
+		blobmsg_add_u64(&b, "samples", info->samples);
+		blobmsg_add_u64(&b, "flows", info->flows);
+		blobmsg_add_u32(&b, "reattaches", info->reattaches);
 
 		if (info->local_ip_family) {
 			flow_addr_to_string(&info->local_ip, info->local_ip_family,
