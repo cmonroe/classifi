@@ -23,6 +23,8 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <linux/if_link.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <ndpi/ndpi_api.h>
 #include <linux/if_ether.h>
@@ -2138,32 +2140,35 @@ int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface)
 	LIBBPF_OPTS(bpf_tc_opts, opts);
 	int ret, idx;
 
-	if (!iface || !iface->ifindex || !iface->name)
+	if (!iface || !iface->name)
 		return -1;
 
-	hook.ifindex = iface->ifindex;
-	hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
+	/* ifindex 0 marks a device the kernel already removed (DELLINK took
+	 * the hooks with it); only the bookkeeping below remains to do */
+	if (iface->ifindex) {
+		hook.ifindex = iface->ifindex;
 
-	hook.attach_point = BPF_TC_INGRESS;
-	opts.handle = iface->tc_handle_ingress;
-	opts.priority = iface->tc_priority_ingress;
-	ret = bpf_tc_detach(&hook, &opts);
-	if (ret && ret != -ENOENT)
-		fprintf(stderr, "warning: failed to detach TC program from %s ingress: %s\n",
-			iface->name, strerror(-ret));
+		hook.attach_point = BPF_TC_INGRESS;
+		opts.handle = iface->tc_handle_ingress;
+		opts.priority = iface->tc_priority_ingress;
+		ret = bpf_tc_detach(&hook, &opts);
+		if (ret && ret != -ENOENT)
+			fprintf(stderr, "warning: failed to detach TC program from %s ingress: %s\n",
+				iface->name, strerror(-ret));
 
-	hook.attach_point = BPF_TC_EGRESS;
-	opts.handle = iface->tc_handle_egress;
-	opts.priority = iface->tc_priority_egress;
-	ret = bpf_tc_detach(&hook, &opts);
-	if (ret && ret != -ENOENT)
-		fprintf(stderr, "warning: failed to detach TC program from %s egress: %s\n",
-			iface->name, strerror(-ret));
+		hook.attach_point = BPF_TC_EGRESS;
+		opts.handle = iface->tc_handle_egress;
+		opts.priority = iface->tc_priority_egress;
+		ret = bpf_tc_detach(&hook, &opts);
+		if (ret && ret != -ENOENT)
+			fprintf(stderr, "warning: failed to detach TC program from %s egress: %s\n",
+				iface->name, strerror(-ret));
 
-	hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
-	bpf_tc_hook_destroy(&hook);
+		hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
+		bpf_tc_hook_destroy(&hook);
 
-	printf("detached BPF program from %s (ifindex %d)\n", iface->name, iface->ifindex);
+		printf("detached BPF program from %s (ifindex %d)\n", iface->name, iface->ifindex);
+	}
 
 	if (iface->discovered && iface->name) {
 		free((void *)iface->name);
@@ -2187,14 +2192,69 @@ static void detach_tc_program(struct classifi_ctx *ctx)
 		detach_interface(ctx, &ctx->interfaces[0]);
 }
 
-int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,
-		      const char *ifname, int discovered)
+static int interface_attach(struct classifi_ctx *ctx, struct interface_info *iface,
+			    int ifindex)
 {
-	int ifindex;
 	LIBBPF_OPTS(bpf_tc_hook, hook);
 	LIBBPF_OPTS(bpf_tc_opts, opts_ingress);
 	LIBBPF_OPTS(bpf_tc_opts, opts_egress);
 	int ret;
+
+	hook.ifindex = ifindex;
+	hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
+
+	/* safety net: previous instance may not have cleaned up (SIGKILL, crash) */
+	bpf_tc_hook_destroy(&hook);
+
+	ret = bpf_tc_hook_create(&hook);
+	if (ret && ret != -EEXIST) {
+		fprintf(stderr, "failed to create TC hook for %s: %s\n", iface->name, strerror(-ret));
+		return ret;
+	}
+
+	hook.attach_point = BPF_TC_INGRESS;
+	opts_ingress.prog_fd = ctx->bpf_prog_fd;
+	opts_ingress.flags = BPF_TC_F_REPLACE;
+	ret = bpf_tc_attach(&hook, &opts_ingress);
+	if (ret) {
+		fprintf(stderr, "failed to attach TC program to %s ingress: %s\n", iface->name, strerror(-ret));
+		hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
+		bpf_tc_hook_destroy(&hook);
+		return ret;
+	}
+
+	hook.attach_point = BPF_TC_EGRESS;
+	opts_egress.prog_fd = ctx->bpf_prog_fd;
+	opts_egress.flags = BPF_TC_F_REPLACE;
+	ret = bpf_tc_attach(&hook, &opts_egress);
+	if (ret) {
+		fprintf(stderr, "failed to attach TC program to %s egress: %s\n", iface->name, strerror(-ret));
+		hook.attach_point = BPF_TC_INGRESS;
+		bpf_tc_detach(&hook, &opts_ingress);
+		hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
+		bpf_tc_hook_destroy(&hook);
+		return ret;
+	}
+
+	printf("attached BPF program to %s ingress+egress (ifindex %d)\n", iface->name, ifindex);
+
+	if (ctx->dump)
+		dump_add_interface(ctx->dump, iface->name, ifindex);
+
+	iface->ifindex = ifindex;
+	iface->tc_handle_ingress = opts_ingress.handle;
+	iface->tc_priority_ingress = opts_ingress.priority;
+	iface->tc_handle_egress = opts_egress.handle;
+	iface->tc_priority_egress = opts_egress.priority;
+	get_interface_ip(iface);
+
+	return 0;
+}
+
+int attach_tc_program(struct classifi_ctx *ctx, const char *ifname, int discovered)
+{
+	struct interface_info *iface;
+	int ifindex, ret;
 
 	if (ctx->num_interfaces >= MAX_INTERFACES) {
 		fprintf(stderr, "maximum number of interfaces (%d) reached\n", MAX_INTERFACES);
@@ -2214,56 +2274,107 @@ int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,
 		return -1;
 	}
 
-	hook.ifindex = ifindex;
-	hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
+	iface = &ctx->interfaces[ctx->num_interfaces];
+	iface->name = ifname;
+	iface->discovered = discovered;
 
-	/* safety net: previous instance may not have cleaned up (SIGKILL, crash) */
-	bpf_tc_hook_destroy(&hook);
-
-	ret = bpf_tc_hook_create(&hook);
-	if (ret && ret != -EEXIST) {
-		fprintf(stderr, "failed to create TC hook for %s: %s\n", ifname, strerror(-ret));
-		return ret;
-	}
-
-	hook.attach_point = BPF_TC_INGRESS;
-	opts_ingress.prog_fd = prog_fd;
-	opts_ingress.flags = BPF_TC_F_REPLACE;
-	ret = bpf_tc_attach(&hook, &opts_ingress);
+	ret = interface_attach(ctx, iface, ifindex);
 	if (ret) {
-		fprintf(stderr, "failed to attach TC program to %s ingress: %s\n", ifname, strerror(-ret));
-		hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
-		bpf_tc_hook_destroy(&hook);
+		memset(iface, 0, sizeof(*iface));
 		return ret;
 	}
 
-	hook.attach_point = BPF_TC_EGRESS;
-	opts_egress.prog_fd = prog_fd;
-	opts_egress.flags = BPF_TC_F_REPLACE;
-	ret = bpf_tc_attach(&hook, &opts_egress);
-	if (ret) {
-		fprintf(stderr, "failed to attach TC program to %s egress: %s\n", ifname, strerror(-ret));
-		hook.attach_point = BPF_TC_INGRESS;
-		bpf_tc_detach(&hook, &opts_ingress);
-		hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
-		bpf_tc_hook_destroy(&hook);
-		return ret;
-	}
-
-	printf("attached BPF program to %s ingress+egress (ifindex %d)\n", ifname, ifindex);
-
-	if (ctx->dump)
-		dump_add_interface(ctx->dump, ifname, ifindex);
-
-	ctx->interfaces[ctx->num_interfaces].name = ifname;
-	ctx->interfaces[ctx->num_interfaces].ifindex = ifindex;
-	ctx->interfaces[ctx->num_interfaces].discovered = discovered;
-	ctx->interfaces[ctx->num_interfaces].tc_handle_ingress = opts_ingress.handle;
-	ctx->interfaces[ctx->num_interfaces].tc_priority_ingress = opts_ingress.priority;
-	ctx->interfaces[ctx->num_interfaces].tc_handle_egress = opts_egress.handle;
-	ctx->interfaces[ctx->num_interfaces].tc_priority_egress = opts_egress.priority;
-	get_interface_ip(&ctx->interfaces[ctx->num_interfaces]);
 	ctx->num_interfaces++;
+
+	return 0;
+}
+
+static void rtnl_link_handle(struct classifi_ctx *ctx, struct nlmsghdr *nlh)
+{
+	struct ifinfomsg *ifi = NLMSG_DATA(nlh);
+	struct rtattr *rta = IFLA_RTA(ifi);
+	int len = nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
+	const char *ifname = NULL;
+	struct interface_info *iface;
+
+	for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len)) {
+		if (rta->rta_type == IFLA_IFNAME) {
+			ifname = RTA_DATA(rta);
+			break;
+		}
+	}
+
+	if (nlh->nlmsg_type == RTM_DELLINK) {
+		iface = interface_by_index(ctx, ifi->ifi_index);
+		if (!iface)
+			return;
+
+		/* the device took its TC hooks with it; keep the slot (and
+		 * name) so the NEWLINK of a re-created device can re-attach */
+		printf("interface %s (ifindex %d) gone, waiting for re-creation\n",
+		       iface->name, iface->ifindex);
+		iface->ifindex = 0;
+		return;
+	}
+
+	if (!ifname)
+		return;
+
+	/* NEWLINK also fires for flag/state changes; act only when the name
+	 * maps to a different device than the one the hooks were put on */
+	iface = interface_by_name(ctx, ifname);
+	if (!iface || iface->ifindex == ifi->ifi_index)
+		return;
+
+	printf("interface %s re-created (ifindex %d -> %d), re-attaching\n",
+	       ifname, iface->ifindex, ifi->ifi_index);
+	iface->ifindex = 0;
+	interface_attach(ctx, iface, ifi->ifi_index);
+}
+
+static void rtnl_fd_handle(struct uloop_fd *fd, unsigned int events)
+{
+	struct classifi_ctx *ctx = container_of(fd, struct classifi_ctx, rtnl_fd);
+	unsigned char buf[8192] __attribute__((aligned(4)));
+	struct nlmsghdr *nlh;
+	ssize_t r;
+	int len;
+
+	while ((r = recv(fd->fd, buf, sizeof(buf), 0)) > 0) {
+		len = (int)r;
+		for (nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, len);
+		     nlh = NLMSG_NEXT(nlh, len)) {
+			if (nlh->nlmsg_type == RTM_NEWLINK ||
+			    nlh->nlmsg_type == RTM_DELLINK)
+				rtnl_link_handle(ctx, nlh);
+		}
+	}
+}
+
+static int rtnl_monitor_init(struct classifi_ctx *ctx)
+{
+	struct sockaddr_nl addr = {
+		.nl_family = AF_NETLINK,
+		.nl_groups = RTMGRP_LINK,
+	};
+	int fd;
+
+	fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
+		    NETLINK_ROUTE);
+	if (fd < 0) {
+		fprintf(stderr, "failed to open rtnetlink socket: %s\n", strerror(errno));
+		return -1;
+	}
+
+	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		fprintf(stderr, "failed to bind rtnetlink socket: %s\n", strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	ctx->rtnl_fd.fd = fd;
+	ctx->rtnl_fd.cb = rtnl_fd_handle;
+	uloop_fd_add(&ctx->rtnl_fd, ULOOP_READ);
 
 	return 0;
 }
@@ -2745,12 +2856,15 @@ int main(int argc, char **argv)
 	ctx.bpf_prog_fd = prog_fd;
 
 	for (int i = 0; i < opts.num_ifaces; i++) {
-		if (attach_tc_program(&ctx, prog_fd, opts.iface_names[i], opts.discover_mode) < 0) {
+		if (attach_tc_program(&ctx, opts.iface_names[i], opts.discover_mode) < 0) {
 			fprintf(stderr, "failed to attach program to interface %s\n", opts.iface_names[i]);
 			err = 1;
 			goto cleanup;
 		}
 	}
+
+	if (rtnl_monitor_init(&ctx) < 0)
+		fprintf(stderr, "warning: link monitor unavailable, re-attach on interface re-creation disabled\n");
 
 	if (opts.dump_filename) {
 		ctx.dump = dump_open(opts.dump_filename);
@@ -2801,6 +2915,10 @@ int main(int argc, char **argv)
 
 cleanup:
 	uloop_fd_delete(&ctx.ringbuf_uloop_fd);
+	if (ctx.rtnl_fd.fd > 0) {
+		uloop_fd_delete(&ctx.rtnl_fd);
+		close(ctx.rtnl_fd.fd);
+	}
 	uloop_timeout_cancel(&ctx.cleanup_timer);
 	uloop_timeout_cancel(&ctx.stats_timer);
 	detach_tc_program(&ctx);

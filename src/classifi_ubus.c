@@ -334,7 +334,7 @@ interfaces_reload(struct classifi_ctx *ctx, int *added, int *removed)
 			continue;
 		}
 
-		if (attach_tc_program(ctx, ctx->bpf_prog_fd, discovered[i], 1) == 0) {
+		if (attach_tc_program(ctx, discovered[i], 1) == 0) {
 			printf("added interface %s\n", discovered[i]);
 			(*added)++;
 		} else {

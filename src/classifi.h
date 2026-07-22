@@ -211,6 +211,7 @@ struct classifi_ctx {
 	struct ring_buffer *ringbuf;
 
 	struct uloop_fd ringbuf_uloop_fd;
+	struct uloop_fd rtnl_fd;
 	struct uloop_timeout cleanup_timer;
 	struct uloop_timeout stats_timer;
 
@@ -285,8 +286,7 @@ void flow_ndpi_feed(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 		    __u16 gso_size, __u16 gso_segs);
 
 struct interface_info *interface_by_name(struct classifi_ctx *ctx, const char *name);
-int attach_tc_program(struct classifi_ctx *ctx, int prog_fd,
-		      const char *ifname, int discovered);
+int attach_tc_program(struct classifi_ctx *ctx, const char *ifname, int discovered);
 int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface);
 
 int ja4_table_load(struct classifi_ctx *ctx, const char *path);
