@@ -549,6 +549,12 @@ classifi_status_handler(struct ubus_context *uctx, struct ubus_object *obj,
 					   info->local_ip_family == FLOW_FAMILY_IPV4 ? "ipv4" : "ipv6");
 		}
 
+		if (info->local_ip6_set) {
+			flow_addr_to_string(&info->local_ip6, FLOW_FAMILY_IPV6,
+					    ip_str, sizeof(ip_str));
+			blobmsg_add_string(&b, "local_ip6", ip_str);
+		}
+
 		blobmsg_close_table(&b, iface_obj);
 	}
 	blobmsg_close_array(&b, ifaces);

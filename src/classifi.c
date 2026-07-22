@@ -343,7 +343,13 @@ static void setup_signals(void)
 static int get_interface_ip(struct interface_info *iface)
 {
 	struct ifaddrs *ifaddr, *ifa;
-	int found = 0;
+	struct sockaddr_in6 *addr6;
+	struct in6_addr ip6_global, ip6_ll;
+	char ip_str[INET6_ADDRSTRLEN];
+	int have_v4 = 0, have_v6_global = 0, have_v6_ll = 0;
+
+	iface->local_ip_family = 0;
+	iface->local_ip6_set = 0;
 
 	if (getifaddrs(&ifaddr) == -1) {
 		fprintf(stderr, "failed to get interface addresses: %s\n", strerror(errno));
@@ -357,10 +363,9 @@ static int get_interface_ip(struct interface_info *iface)
 		if (strcmp(ifa->ifa_name, iface->name) != 0)
 			continue;
 
-		if (ifa->ifa_addr->sa_family == AF_INET) {
+		if (ifa->ifa_addr->sa_family == AF_INET && !have_v4) {
 			struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
 			struct sockaddr_in *netmask = (struct sockaddr_in *)ifa->ifa_netmask;
-			char ip_str[INET_ADDRSTRLEN];
 
 			iface->local_ip_family = FLOW_FAMILY_IPV4;
 			iface->local_ip.hi = 0;
@@ -369,38 +374,56 @@ static int get_interface_ip(struct interface_info *iface)
 			if (netmask)
 				iface->local_subnet_mask = netmask->sin_addr.s_addr;
 
-			found = 1;
-			inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
-
-			if (netmask) {
-				char mask_str[INET_ADDRSTRLEN];
-				inet_ntop(AF_INET, &netmask->sin_addr, mask_str, sizeof(mask_str));
-				printf("interface %s IPv4: %s/%s\n", iface->name, ip_str, mask_str);
-			} else {
-				printf("interface %s IPv4: %s\n", iface->name, ip_str);
-			}
-			break;
+			have_v4 = 1;
+			continue;
 		}
 
-		if (ifa->ifa_addr->sa_family == AF_INET6 && !found) {
-			struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)ifa->ifa_addr;
-			char ip_str[INET6_ADDRSTRLEN];
+		if (ifa->ifa_addr->sa_family != AF_INET6)
+			continue;
 
-			iface->local_ip_family = FLOW_FAMILY_IPV6;
-			memcpy(&iface->local_ip, &addr6->sin6_addr, sizeof(struct in6_addr));
-			found = 1;
-
-			inet_ntop(AF_INET6, &addr6->sin6_addr, ip_str, sizeof(ip_str));
-			printf("interface %s IPv6: %s\n", iface->name, ip_str);
+		addr6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+		if (IN6_IS_ADDR_LINKLOCAL(&addr6->sin6_addr)) {
+			if (!have_v6_ll) {
+				ip6_ll = addr6->sin6_addr;
+				have_v6_ll = 1;
+			}
+		} else if (!have_v6_global) {
+			ip6_global = addr6->sin6_addr;
+			have_v6_global = 1;
 		}
 	}
 
 	freeifaddrs(ifaddr);
 
-	if (!found)
-		fprintf(stderr, "warning: could not determine IP address for %s\n", iface->name);
+	if (have_v6_global || have_v6_ll) {
+		memcpy(&iface->local_ip6,
+		       have_v6_global ? &ip6_global : &ip6_ll,
+		       sizeof(struct in6_addr));
+		iface->local_ip6_set = 1;
+	}
 
-	return found ? 0 : -1;
+	if (!have_v4 && iface->local_ip6_set) {
+		iface->local_ip_family = FLOW_FAMILY_IPV6;
+		iface->local_ip = iface->local_ip6;
+	}
+
+	if (have_v4) {
+		flow_addr_to_string(&iface->local_ip, FLOW_FAMILY_IPV4,
+				    ip_str, sizeof(ip_str));
+		printf("interface %s IPv4: %s\n", iface->name, ip_str);
+	}
+	if (iface->local_ip6_set) {
+		flow_addr_to_string(&iface->local_ip6, FLOW_FAMILY_IPV6,
+				    ip_str, sizeof(ip_str));
+		printf("interface %s IPv6: %s\n", iface->name, ip_str);
+	}
+
+	if (!have_v4 && !iface->local_ip6_set) {
+		fprintf(stderr, "warning: could not determine IP address for %s\n", iface->name);
+		return -1;
+	}
+
+	return 0;
 }
 
 static int is_tls_or_quic(u_int16_t proto)

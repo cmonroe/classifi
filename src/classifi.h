@@ -93,6 +93,8 @@ struct interface_info {
 	struct flow_addr local_ip;
 	__u8 local_ip_family;
 	__u32 local_subnet_mask;
+	struct flow_addr local_ip6;
+	__u8 local_ip6_set;
 	__u8 discovered;
 	__u32 tc_handle_ingress;
 	__u32 tc_priority_ingress;
