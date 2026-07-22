@@ -292,6 +292,7 @@ interfaces_reload(struct classifi_ctx *ctx, int *added, int *removed)
 
 	for (int i = ctx->num_interfaces - 1; i >= 0; i--) {
 		struct interface_info *iface = &ctx->interfaces[i];
+		unsigned int cur_ifindex;
 		int found = 0;
 
 		if (!iface->discovered)
@@ -308,7 +309,20 @@ interfaces_reload(struct classifi_ctx *ctx, int *added, int *removed)
 			printf("removing interface %s (no longer in UCI config)\n", iface->name);
 			detach_interface(ctx, iface);
 			(*removed)++;
+			continue;
 		}
+
+		/* A recreated device (netifd bridge rebuild) gets a new ifindex
+		 * and takes the TC hooks down with the old one; detaching here
+		 * lets the add pass below re-attach under the new ifindex. */
+		cur_ifindex = if_nametoindex(iface->name);
+		if (cur_ifindex == (unsigned int)iface->ifindex)
+			continue;
+
+		printf("interface %s ifindex changed (%d -> %u), re-attaching\n",
+		       iface->name, iface->ifindex, cur_ifindex);
+		detach_interface(ctx, iface);
+		(*removed)++;
 	}
 
 	for (int i = 0; i < num_discovered; i++) {
