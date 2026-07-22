@@ -561,6 +561,8 @@ void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 	blobmsg_add_string(&b, "dst_ip", dst_ip);
 	blobmsg_add_u32(&b, "dst_port", summary_key.dst_port);
 	blobmsg_add_u32(&b, "protocol", summary_key.protocol);
+	blobmsg_add_string(&b, "family",
+			   summary_key.family == FLOW_FAMILY_IPV4 ? "ipv4" : "ipv6");
 	blobmsg_add_string(&b, "master_protocol", master_name);
 	blobmsg_add_string(&b, "app_protocol", app_name);
 	blobmsg_add_string(&b, "category", category_name);
@@ -785,6 +787,8 @@ static void emit_rule_match_event(struct classifi_ctx *ctx,
 	blobmsg_add_string(&b, "dst_ip", dst_ip);
 	blobmsg_add_u32(&b, "dst_port", key->dst_port);
 	blobmsg_add_u32(&b, "protocol", key->protocol);
+	blobmsg_add_string(&b, "family",
+			   key->family == FLOW_FAMILY_IPV4 ? "ipv4" : "ipv6");
 
 	for (int i = 0; i < num_extracts && i < MAX_EXTRACTS; i++) {
 		char field_name[20];
