@@ -55,15 +55,6 @@ struct {
 	__type(value, __u64);
 } ringbuf_stats SEC(".maps");
 
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
-	/* 2x: a stale entry can linger between a missed DELLINK and the
-	 * reload catch-up */
-	__uint(max_entries, MAX_INTERFACES * 2);
-	__type(key, __u32);
-	__type(value, struct iface_stat);
-} iface_stats SEC(".maps");
-
 /*
  * Staging area for variable-size ring buffer records.
  * bpf_ringbuf_reserve() only takes a compile-time constant size, so
@@ -325,17 +316,7 @@ int classifi(struct __sk_buff *skb)
 	__u64 old_count;
 	__u16 l3_offset = 0;
 	struct l4_meta l4 = {};
-	__u32 stats_key = skb->ifindex;
-	struct iface_stat *ist;
 	int ret;
-
-	/* userspace seeds one entry per attached ifindex, so per-CPU
-	 * non-atomic increments are all the hot path pays for the counters */
-	ist = bpf_map_lookup_elem(&iface_stats, &stats_key);
-	if (ist) {
-		ist->packets++;
-		ist->bytes += skb->len;
-	}
 
 	/*
 	 * Forwarded traffic normally has the headers in the linear area, so

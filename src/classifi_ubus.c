@@ -559,7 +559,7 @@ classifi_status_handler(struct ubus_context *uctx, struct ubus_object *obj,
 		blobmsg_add_u32(&b, "ifindex", info->ifindex);
 		blobmsg_add_u8(&b, "discovered", info->discovered);
 
-		iface_stats_total(g_ctx, info, &pkts, &bytes);
+		clsact_stats_read(info->ifindex, &pkts, &bytes);
 		blobmsg_add_u64(&b, "packets", pkts);
 		blobmsg_add_u64(&b, "bytes", bytes);
 		blobmsg_add_u64(&b, "samples", info->samples);

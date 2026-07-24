@@ -42,7 +42,6 @@
 #endif
 
 #define MAX_FLOWS 8192
-#define MAX_INTERFACES 8
 
 /*
  * GRO can coalesce multiple TCP segments into a single skb, producing
@@ -74,11 +73,6 @@ struct flow_key {
 	struct flow_addr src;
 	struct flow_addr dst;
 } __attribute__((packed));
-
-struct iface_stat {
-	__u64 packets;
-	__u64 bytes;
-};
 
 struct flow_info {
 	__u64 packets;

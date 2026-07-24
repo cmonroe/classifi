@@ -82,6 +82,7 @@ static inline const char *flow_family_str(__u8 family)
 }
 
 #define FLOW_TABLE_SIZE 4096
+#define MAX_INTERFACES 8
 
 /*
  * The kernel LRU map keeps evicting old entries under a flow flood, so new
@@ -100,10 +101,6 @@ struct interface_info {
 	struct flow_addr local_ip6;
 	__u8 local_ip6_set;
 	__u8 discovered;
-	/* kernel counters harvested across re-attach so totals stay
-	 * continuous per interface name, not per ifindex incarnation */
-	__u64 acc_packets;
-	__u64 acc_bytes;
 	__u64 samples;
 	__u64 flows;
 	__u32 reattaches;
@@ -221,8 +218,6 @@ struct classifi_ctx {
 	int ringbuf_stats_fd;
 	struct ring_buffer *ringbuf;
 
-	int iface_stats_fd;
-
 	__u64 samples_total;
 	__u64 flows_created;
 	__u64 flows_expired;
@@ -311,8 +306,7 @@ int attach_tc_program(struct classifi_ctx *ctx, const char *ifname, int discover
 int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface);
 void interface_ifindex_sync(struct classifi_ctx *ctx, struct interface_info *iface,
 			    int cur_ifindex);
-void iface_stats_total(struct classifi_ctx *ctx, struct interface_info *iface,
-		       __u64 *packets, __u64 *bytes);
+int clsact_stats_read(int ifindex, __u64 *packets, __u64 *bytes);
 int ipv6_l4_offset(const unsigned char *l3_data, unsigned int l3_len,
 		   struct ipv6_eh *eh);
 

@@ -25,6 +25,7 @@
 #include <linux/if_link.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <linux/gen_stats.h>
 #include <net/if.h>
 #include <ndpi/ndpi_api.h>
 #include <linux/if_ether.h>
@@ -2139,7 +2140,7 @@ static int handle_sample(void *ctx, void *data, size_t len)
 	return 0;
 }
 
-static void interface_link_down(struct classifi_ctx *ctx, struct interface_info *iface);
+static void interface_link_down(struct interface_info *iface);
 
 static void tc_hooks_detach(struct interface_info *iface)
 {
@@ -2181,7 +2182,7 @@ int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface)
 	if (iface->ifindex) {
 		tc_hooks_detach(iface);
 		printf("detached BPF program from %s (ifindex %d)\n", iface->name, iface->ifindex);
-		interface_link_down(ctx, iface);
+		interface_link_down(iface);
 	}
 
 	if (iface->discovered) {
@@ -2206,36 +2207,74 @@ static void detach_tc_program(struct classifi_ctx *ctx)
 		detach_interface(ctx, &ctx->interfaces[0]);
 }
 
-static struct iface_stat *iface_stat_vals_alloc(struct classifi_ctx *ctx, int *ncpus)
+static int qdisc_stats_parse(const struct nlmsghdr *nlh, __u64 *packets,
+			     __u64 *bytes)
 {
-	*ncpus = libbpf_num_possible_cpus();
+	const struct tcmsg *tcm = NLMSG_DATA(nlh);
+	struct rtattr *rta = TCA_RTA(tcm);
+	int len = nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*tcm));
+	const struct rtattr *stats2 = NULL;
+	const char *kind = NULL;
+	int have_pkt64 = 0;
 
-	if (ctx->iface_stats_fd < 0 || *ncpus <= 0)
-		return NULL;
+	for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len)) {
+		if ((rta->rta_type & NLA_TYPE_MASK) == TCA_KIND)
+			kind = RTA_DATA(rta);
+		else if ((rta->rta_type & NLA_TYPE_MASK) == TCA_STATS2)
+			stats2 = rta;
+	}
 
-	return calloc(*ncpus, sizeof(struct iface_stat));
+	/* a plain "ingress" qdisc answers the same lookup, but it is not
+	 * ours and only counts one direction */
+	if (!kind || strcmp(kind, "clsact") != 0 || !stats2)
+		return -1;
+
+	rta = RTA_DATA(stats2);
+	len = RTA_PAYLOAD(stats2);
+	for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len)) {
+		int type = rta->rta_type & NLA_TYPE_MASK;
+
+		if (type == TCA_STATS_BASIC &&
+		    RTA_PAYLOAD(rta) >= sizeof(struct gnet_stats_basic)) {
+			struct gnet_stats_basic sb;
+
+			memcpy(&sb, RTA_DATA(rta), sizeof(sb));
+			*bytes = sb.bytes;
+			if (!have_pkt64)
+				*packets = sb.packets;
+		} else if (type == TCA_STATS_PKT64 &&
+			   RTA_PAYLOAD(rta) >= sizeof(__u64)) {
+			memcpy(packets, RTA_DATA(rta), sizeof(*packets));
+			have_pkt64 = 1;
+		}
+	}
+
+	return 0;
 }
 
-static void iface_stats_seed(struct classifi_ctx *ctx, int ifindex)
+/*
+ * The clsact qdisc counts every hook traversal into one per-CPU bstats
+ * shared by both directions (tc_run() updates it before the filters run),
+ * so the kernel already maintains the per-interface totals and the BPF
+ * fast path need not. The counters live and die with the qdisc, i.e.
+ * they reset on re-attach, matching netdev counter lifetime.
+ */
+int clsact_stats_read(int ifindex, __u64 *packets, __u64 *bytes)
 {
-	struct iface_stat *vals;
-	__u32 key = ifindex;
-	int ncpus;
-
-	vals = iface_stat_vals_alloc(ctx, &ncpus);
-	if (!vals)
-		return;
-
-	bpf_map_update_elem(ctx->iface_stats_fd, &key, vals, BPF_ANY);
-	free(vals);
-}
-
-static int iface_stats_read(struct classifi_ctx *ctx, int ifindex,
-			    __u64 *packets, __u64 *bytes)
-{
-	struct iface_stat *vals;
-	__u32 key = ifindex;
-	int ncpus;
+	struct {
+		struct nlmsghdr nlh;
+		struct tcmsg tcm;
+	} req = {
+		.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg)),
+		.nlh.nlmsg_type = RTM_GETQDISC,
+		.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP,
+		.tcm.tcm_family = AF_UNSPEC,
+		.tcm.tcm_ifindex = ifindex,
+	};
+	unsigned char buf[32768] __attribute__((aligned(4)));
+	struct nlmsghdr *nlh;
+	ssize_t r;
+	int fd, ret = -1, done = 0;
 
 	*packets = 0;
 	*bytes = 0;
@@ -2243,59 +2282,52 @@ static int iface_stats_read(struct classifi_ctx *ctx, int ifindex,
 	if (ifindex <= 0)
 		return -1;
 
-	vals = iface_stat_vals_alloc(ctx, &ncpus);
-	if (!vals)
+	fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (fd < 0)
 		return -1;
 
-	if (bpf_map_lookup_elem(ctx->iface_stats_fd, &key, vals) != 0) {
-		free(vals);
+	if (send(fd, &req, req.nlh.nlmsg_len, 0) != (ssize_t)req.nlh.nlmsg_len) {
+		close(fd);
 		return -1;
 	}
 
-	for (int i = 0; i < ncpus; i++) {
-		*packets += vals[i].packets;
-		*bytes += vals[i].bytes;
+	/*
+	 * Dump, not a targeted get: the non-dump RTM_GETQDISC only answers
+	 * the requester when NLM_F_ECHO is set, and sends nothing at all
+	 * when the resolved qdisc is a builtin (noop after clsact removal),
+	 * either of which strands a blocking recv. A dump always terminates
+	 * with NLMSG_DONE. It ignores tcm_ifindex and walks every device,
+	 * so filter here.
+	 */
+	while (!done && (r = recv(fd, buf, sizeof(buf), 0)) > 0) {
+		int len = (int)r;
+
+		for (nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, len);
+		     nlh = NLMSG_NEXT(nlh, len)) {
+			const struct tcmsg *tcm = NLMSG_DATA(nlh);
+
+			if (nlh->nlmsg_type == NLMSG_DONE ||
+			    nlh->nlmsg_type == NLMSG_ERROR) {
+				done = 1;
+				break;
+			}
+
+			if (nlh->nlmsg_type != RTM_NEWQDISC ||
+			    tcm->tcm_ifindex != ifindex)
+				continue;
+
+			if (qdisc_stats_parse(nlh, packets, bytes) == 0)
+				ret = 0;
+		}
 	}
 
-	free(vals);
+	close(fd);
 
-	return 0;
+	return ret;
 }
 
-void iface_stats_total(struct classifi_ctx *ctx, struct interface_info *iface,
-		       __u64 *packets, __u64 *bytes)
+static void interface_link_down(struct interface_info *iface)
 {
-	__u64 cur_packets, cur_bytes;
-
-	*packets = iface->acc_packets;
-	*bytes = iface->acc_bytes;
-
-	if (iface_stats_read(ctx, iface->ifindex, &cur_packets, &cur_bytes) == 0) {
-		*packets += cur_packets;
-		*bytes += cur_bytes;
-	}
-}
-
-static void iface_stats_harvest(struct classifi_ctx *ctx, struct interface_info *iface)
-{
-	__u64 packets, bytes;
-	__u32 key = iface->ifindex;
-
-	if (!iface->ifindex)
-		return;
-
-	if (iface_stats_read(ctx, iface->ifindex, &packets, &bytes) == 0) {
-		iface->acc_packets += packets;
-		iface->acc_bytes += bytes;
-	}
-
-	if (ctx->iface_stats_fd >= 0)
-		bpf_map_delete_elem(ctx->iface_stats_fd, &key);
-}
-
-static void interface_link_down(struct classifi_ctx *ctx, struct interface_info *iface)
-{
-	iface_stats_harvest(ctx, iface);
 	iface->ifindex = 0;
 }
 
@@ -2353,7 +2385,6 @@ static int interface_attach(struct classifi_ctx *ctx, struct interface_info *ifa
 	iface->tc_priority_ingress = opts_ingress.priority;
 	iface->tc_handle_egress = opts_egress.handle;
 	iface->tc_priority_egress = opts_egress.priority;
-	iface_stats_seed(ctx, ifindex);
 	get_interface_ip(iface);
 
 	return 0;
@@ -2362,7 +2393,7 @@ static int interface_attach(struct classifi_ctx *ctx, struct interface_info *ifa
 static int interface_reattach(struct classifi_ctx *ctx, struct interface_info *iface,
 			      int ifindex)
 {
-	interface_link_down(ctx, iface);
+	interface_link_down(iface);
 	iface->reattaches++;
 
 	return interface_attach(ctx, iface, ifindex);
@@ -2384,7 +2415,7 @@ void interface_ifindex_sync(struct classifi_ctx *ctx, struct interface_info *ifa
 	if (!cur_ifindex) {
 		printf("interface %s (ifindex %d) gone, waiting for re-creation\n",
 		       iface->name, iface->ifindex);
-		interface_link_down(ctx, iface);
+		interface_link_down(iface);
 		return;
 	}
 
@@ -2891,7 +2922,6 @@ int main(int argc, char **argv)
 	ctx.bpf_prog_fd = -1;
 	ctx.flow_map_fd = -1;
 	ctx.ringbuf_stats_fd = -1;
-	ctx.iface_stats_fd = -1;
 
 	signal(SIGCHLD, SIG_IGN);
 
@@ -2985,9 +3015,6 @@ int main(int argc, char **argv)
 		err = 1;
 		goto cleanup;
 	}
-
-	/* absent in an older BPF object; per-interface counters read zero then */
-	ctx.iface_stats_fd = bpf_object__find_map_fd_by_name(ctx.bpf_obj, "iface_stats");
 
 	ctx.bpf_prog_fd = prog_fd;
 
