@@ -347,11 +347,10 @@ static int get_interface_ip(struct interface_info *iface)
 {
 	struct ifaddrs *ifaddr, *ifa;
 	struct sockaddr_in6 *addr6;
-	struct in6_addr ip6_global, ip6_ll;
 	char ip_str[INET6_ADDRSTRLEN];
-	int have_v4 = 0, have_v6_global = 0, have_v6_ll = 0;
+	int have_v6_global = 0;
 
-	iface->local_ip_family = 0;
+	iface->local_ip4_set = 0;
 	iface->local_ip6_set = 0;
 
 	if (getifaddrs(&ifaddr) == -1) {
@@ -366,52 +365,43 @@ static int get_interface_ip(struct interface_info *iface)
 		if (strcmp(ifa->ifa_name, iface->name) != 0)
 			continue;
 
-		if (ifa->ifa_addr->sa_family == AF_INET && !have_v4) {
+		if (ifa->ifa_addr->sa_family == AF_INET && !iface->local_ip4_set) {
 			struct sockaddr_in *addr = (struct sockaddr_in *)ifa->ifa_addr;
 			struct sockaddr_in *netmask = (struct sockaddr_in *)ifa->ifa_netmask;
 
-			iface->local_ip_family = FLOW_FAMILY_IPV4;
-			iface->local_ip.hi = 0;
-			iface->local_ip.lo = (__u64)addr->sin_addr.s_addr;
+			iface->local_ip4.hi = 0;
+			iface->local_ip4.lo = (__u64)addr->sin_addr.s_addr;
+			iface->local_ip4_set = 1;
 
 			if (netmask)
 				iface->local_subnet_mask = netmask->sin_addr.s_addr;
 
-			have_v4 = 1;
 			continue;
 		}
 
 		if (ifa->ifa_addr->sa_family != AF_INET6)
 			continue;
 
+		/* first global wins; a link-local is kept only until a
+		 * global shows up */
 		addr6 = (struct sockaddr_in6 *)ifa->ifa_addr;
 		if (IN6_IS_ADDR_LINKLOCAL(&addr6->sin6_addr)) {
-			if (!have_v6_ll) {
-				ip6_ll = addr6->sin6_addr;
-				have_v6_ll = 1;
-			}
-		} else if (!have_v6_global) {
-			ip6_global = addr6->sin6_addr;
+			if (iface->local_ip6_set)
+				continue;
+		} else {
+			if (have_v6_global)
+				continue;
 			have_v6_global = 1;
 		}
+
+		memcpy(&iface->local_ip6, &addr6->sin6_addr, sizeof(struct in6_addr));
+		iface->local_ip6_set = 1;
 	}
 
 	freeifaddrs(ifaddr);
 
-	if (have_v6_global || have_v6_ll) {
-		memcpy(&iface->local_ip6,
-		       have_v6_global ? &ip6_global : &ip6_ll,
-		       sizeof(struct in6_addr));
-		iface->local_ip6_set = 1;
-	}
-
-	if (!have_v4 && iface->local_ip6_set) {
-		iface->local_ip_family = FLOW_FAMILY_IPV6;
-		iface->local_ip = iface->local_ip6;
-	}
-
-	if (have_v4) {
-		flow_addr_to_string(&iface->local_ip, FLOW_FAMILY_IPV4,
+	if (iface->local_ip4_set) {
+		flow_addr_to_string(&iface->local_ip4, FLOW_FAMILY_IPV4,
 				    ip_str, sizeof(ip_str));
 		printf("interface %s IPv4: %s\n", iface->name, ip_str);
 	}
@@ -421,7 +411,7 @@ static int get_interface_ip(struct interface_info *iface)
 		printf("interface %s IPv6: %s\n", iface->name, ip_str);
 	}
 
-	if (!have_v4 && !iface->local_ip6_set) {
+	if (!iface->local_ip4_set && !iface->local_ip6_set) {
 		fprintf(stderr, "warning: could not determine IP address for %s\n", iface->name);
 		return -1;
 	}
@@ -564,8 +554,7 @@ void emit_classification_event(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 	blobmsg_add_string(&b, "dst_ip", dst_ip);
 	blobmsg_add_u32(&b, "dst_port", summary_key.dst_port);
 	blobmsg_add_u32(&b, "protocol", summary_key.protocol);
-	blobmsg_add_string(&b, "family",
-			   summary_key.family == FLOW_FAMILY_IPV4 ? "ipv4" : "ipv6");
+	blobmsg_add_string(&b, "family", flow_family_str(summary_key.family));
 	blobmsg_add_string(&b, "master_protocol", master_name);
 	blobmsg_add_string(&b, "app_protocol", app_name);
 	blobmsg_add_string(&b, "category", category_name);
@@ -673,6 +662,28 @@ void emit_dns_event(struct classifi_ctx *ctx, const char *client_ip, const char 
 #define TCP_F_ACK 0x10
 
 /*
+ * Resolve the offset from an IPv6 fixed header to the transport header.
+ * Returns -1 when the fixed header does not fit l3_len (eh zeroed);
+ * otherwise returns the offset with the walk result in eh, and the caller
+ * applies its own eh->l4_ok / eh->protocol / eh->frag policy.
+ */
+int ipv6_l4_offset(const unsigned char *l3_data, unsigned int l3_len,
+		   struct ipv6_eh *eh)
+{
+	const struct ipv6hdr *ip6h = (const struct ipv6hdr *)l3_data;
+
+	if (l3_len < sizeof(*ip6h)) {
+		memset(eh, 0, sizeof(*eh));
+		return -1;
+	}
+
+	ipv6_eh_walk(l3_data + sizeof(*ip6h), l3_data + l3_len,
+		     ntohs(ip6h->payload_len), ip6h->nexthdr, eh);
+
+	return sizeof(*ip6h) + eh->len;
+}
+
+/*
  * Validate that the sample holds a complete IPv4/IPv6 TCP or UDP header and
  * return a pointer to it (NULL otherwise). When non-NULL, ip_hdr_len_out
  * receives the L3 header length so callers can locate the L4 payload without
@@ -701,20 +712,15 @@ static const void *l4_hdr_locate(const struct packet_sample *sample,
 		protocol = iph->protocol;
 		ip_hdr_len = iph->ihl * 4;
 	} else if (sample->key.family == FLOW_FAMILY_IPV6) {
-		const struct ipv6hdr *ip6h = (const struct ipv6hdr *)ip_packet;
 		struct ipv6_eh eh;
+		int l4_off = ipv6_l4_offset(ip_packet,
+					    sample->data_len - l3_offset, &eh);
 
-		if (l3_offset + sizeof(struct ipv6hdr) > sample->data_len)
-			return NULL;
-
-		ipv6_eh_walk(ip_packet + sizeof(struct ipv6hdr),
-			     sample->data + sample->data_len,
-			     ntohs(ip6h->payload_len), ip6h->nexthdr, &eh);
-		if (!eh.l4_ok)
+		if (l4_off < 0 || !eh.l4_ok)
 			return NULL;
 
 		protocol = eh.protocol;
-		ip_hdr_len = sizeof(struct ipv6hdr) + eh.len;
+		ip_hdr_len = l4_off;
 	} else {
 		return NULL;
 	}
@@ -792,8 +798,7 @@ static void emit_rule_match_event(struct classifi_ctx *ctx,
 	blobmsg_add_string(&b, "dst_ip", dst_ip);
 	blobmsg_add_u32(&b, "dst_port", key->dst_port);
 	blobmsg_add_u32(&b, "protocol", key->protocol);
-	blobmsg_add_string(&b, "family",
-			   key->family == FLOW_FAMILY_IPV4 ? "ipv4" : "ipv6");
+	blobmsg_add_string(&b, "family", flow_family_str(key->family));
 
 	for (int i = 0; i < num_extracts && i < MAX_EXTRACTS; i++) {
 		char field_name[20];
@@ -1005,18 +1010,13 @@ static const unsigned char *dns_payload_extract(const unsigned char *l3_data,
 		unsigned int ip_hdr_len = iph->ihl * 4;
 		offset = ip_hdr_len + 8;
 	} else {
-		const struct ipv6hdr *ip6h = (const struct ipv6hdr *)l3_data;
 		struct ipv6_eh eh;
+		int l4_off = ipv6_l4_offset(l3_data, l3_len, &eh);
 
-		if (l3_len < sizeof(struct ipv6hdr))
+		if (l4_off < 0 || !eh.l4_ok || eh.protocol != IPPROTO_UDP)
 			return NULL;
 
-		ipv6_eh_walk(l3_data + sizeof(struct ipv6hdr), l3_data + l3_len,
-			     ntohs(ip6h->payload_len), ip6h->nexthdr, &eh);
-		if (!eh.l4_ok || eh.protocol != IPPROTO_UDP)
-			return NULL;
-
-		offset = sizeof(struct ipv6hdr) + eh.len + 8;
+		offset = l4_off + 8;
 	}
 
 	if (offset >= l3_len)
@@ -1554,17 +1554,12 @@ static void log_ndpi_direction_debug(struct ndpi_flow *flow, const struct flow_k
 			return;
 		ip_hdr_len = iph->ihl * 4;
 	} else {
-		struct ipv6hdr *ip6h = (struct ipv6hdr *)ip_packet;
 		struct ipv6_eh eh;
+		int l4_off = ipv6_l4_offset(ip_packet, ip_packet_len, &eh);
 
-		if (ip_packet_len < sizeof(struct ipv6hdr))
+		if (l4_off < 0 || !eh.l4_ok || eh.protocol != IPPROTO_TCP)
 			return;
-		ipv6_eh_walk(ip_packet + sizeof(struct ipv6hdr),
-			     ip_packet + ip_packet_len,
-			     ntohs(ip6h->payload_len), ip6h->nexthdr, &eh);
-		if (!eh.l4_ok || eh.protocol != IPPROTO_TCP)
-			return;
-		ip_hdr_len = sizeof(struct ipv6hdr) + eh.len;
+		ip_hdr_len = l4_off;
 	}
 
 	if (ip_hdr_len + sizeof(struct tcphdr) > ip_packet_len)
@@ -1740,15 +1735,11 @@ static int udp_dgram_parse(const unsigned char *l3_data, unsigned int l3_len,
 		break;
 	case 6: {
 		struct ipv6_eh eh;
+		int l4_off = ipv6_l4_offset(l3_data, l3_len, &eh);
 
-		if (l3_len < 40)
+		if (l4_off < 0 || !eh.l4_ok || eh.frag || eh.protocol != IPPROTO_UDP)
 			return -1;
-		ipv6_eh_walk(l3_data + 40, l3_data + l3_len,
-			     ((__u32)l3_data[4] << 8) | l3_data[5],
-			     l3_data[6], &eh);
-		if (!eh.l4_ok || eh.frag || eh.protocol != IPPROTO_UDP)
-			return -1;
-		udp_off = 40 + eh.len;
+		udp_off = l4_off;
 		if (l3_len < udp_off + 8)
 			return -1;
 		break;
@@ -2055,7 +2046,7 @@ static void classify_packet(struct classifi_ctx *ctx, struct packet_sample *samp
 	if (!flow)
 		return;
 
-	ifname = iface ? iface->name : "unknown";
+	ifname = interface_name_by_index(ctx, sample->ifindex);
 
 	if (!flow->ifindex) {
 		flow->ifindex = sample->ifindex;
@@ -2148,11 +2139,39 @@ static int handle_sample(void *ctx, void *data, size_t len)
 	return 0;
 }
 
-int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface)
+static void interface_link_down(struct classifi_ctx *ctx, struct interface_info *iface);
+
+static void tc_hooks_detach(struct interface_info *iface)
 {
 	LIBBPF_OPTS(bpf_tc_hook, hook);
 	LIBBPF_OPTS(bpf_tc_opts, opts);
-	int ret, idx;
+	int ret;
+
+	hook.ifindex = iface->ifindex;
+
+	hook.attach_point = BPF_TC_INGRESS;
+	opts.handle = iface->tc_handle_ingress;
+	opts.priority = iface->tc_priority_ingress;
+	ret = bpf_tc_detach(&hook, &opts);
+	if (ret && ret != -ENOENT)
+		fprintf(stderr, "warning: failed to detach TC program from %s ingress: %s\n",
+			iface->name, strerror(-ret));
+
+	hook.attach_point = BPF_TC_EGRESS;
+	opts.handle = iface->tc_handle_egress;
+	opts.priority = iface->tc_priority_egress;
+	ret = bpf_tc_detach(&hook, &opts);
+	if (ret && ret != -ENOENT)
+		fprintf(stderr, "warning: failed to detach TC program from %s egress: %s\n",
+			iface->name, strerror(-ret));
+
+	hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
+	bpf_tc_hook_destroy(&hook);
+}
+
+int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface)
+{
+	int idx;
 
 	if (!iface || !iface->name)
 		return -1;
@@ -2160,37 +2179,12 @@ int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface)
 	/* ifindex 0 marks a device the kernel already removed (DELLINK took
 	 * the hooks with it); only the bookkeeping below remains to do */
 	if (iface->ifindex) {
-		hook.ifindex = iface->ifindex;
-
-		hook.attach_point = BPF_TC_INGRESS;
-		opts.handle = iface->tc_handle_ingress;
-		opts.priority = iface->tc_priority_ingress;
-		ret = bpf_tc_detach(&hook, &opts);
-		if (ret && ret != -ENOENT)
-			fprintf(stderr, "warning: failed to detach TC program from %s ingress: %s\n",
-				iface->name, strerror(-ret));
-
-		hook.attach_point = BPF_TC_EGRESS;
-		opts.handle = iface->tc_handle_egress;
-		opts.priority = iface->tc_priority_egress;
-		ret = bpf_tc_detach(&hook, &opts);
-		if (ret && ret != -ENOENT)
-			fprintf(stderr, "warning: failed to detach TC program from %s egress: %s\n",
-				iface->name, strerror(-ret));
-
-		hook.attach_point = BPF_TC_INGRESS | BPF_TC_EGRESS;
-		bpf_tc_hook_destroy(&hook);
-
-		if (ctx->iface_stats_fd >= 0) {
-			__u32 stats_key = iface->ifindex;
-
-			bpf_map_delete_elem(ctx->iface_stats_fd, &stats_key);
-		}
-
+		tc_hooks_detach(iface);
 		printf("detached BPF program from %s (ifindex %d)\n", iface->name, iface->ifindex);
+		interface_link_down(ctx, iface);
 	}
 
-	if (iface->discovered && iface->name) {
+	if (iface->discovered) {
 		free((void *)iface->name);
 		iface->name = NULL;
 	}
@@ -2212,16 +2206,23 @@ static void detach_tc_program(struct classifi_ctx *ctx)
 		detach_interface(ctx, &ctx->interfaces[0]);
 }
 
+static struct iface_stat *iface_stat_vals_alloc(struct classifi_ctx *ctx, int *ncpus)
+{
+	*ncpus = libbpf_num_possible_cpus();
+
+	if (ctx->iface_stats_fd < 0 || *ncpus <= 0)
+		return NULL;
+
+	return calloc(*ncpus, sizeof(struct iface_stat));
+}
+
 static void iface_stats_seed(struct classifi_ctx *ctx, int ifindex)
 {
-	int ncpus = libbpf_num_possible_cpus();
 	struct iface_stat *vals;
 	__u32 key = ifindex;
+	int ncpus;
 
-	if (ctx->iface_stats_fd < 0 || ncpus <= 0)
-		return;
-
-	vals = calloc(ncpus, sizeof(*vals));
+	vals = iface_stat_vals_alloc(ctx, &ncpus);
 	if (!vals)
 		return;
 
@@ -2229,20 +2230,20 @@ static void iface_stats_seed(struct classifi_ctx *ctx, int ifindex)
 	free(vals);
 }
 
-int iface_stats_read(struct classifi_ctx *ctx, int ifindex,
-		     __u64 *packets, __u64 *bytes)
+static int iface_stats_read(struct classifi_ctx *ctx, int ifindex,
+			    __u64 *packets, __u64 *bytes)
 {
-	int ncpus = libbpf_num_possible_cpus();
 	struct iface_stat *vals;
 	__u32 key = ifindex;
+	int ncpus;
 
 	*packets = 0;
 	*bytes = 0;
 
-	if (ctx->iface_stats_fd < 0 || ifindex <= 0 || ncpus <= 0)
+	if (ifindex <= 0)
 		return -1;
 
-	vals = calloc(ncpus, sizeof(*vals));
+	vals = iface_stat_vals_alloc(ctx, &ncpus);
 	if (!vals)
 		return -1;
 
@@ -2259,6 +2260,20 @@ int iface_stats_read(struct classifi_ctx *ctx, int ifindex,
 	free(vals);
 
 	return 0;
+}
+
+void iface_stats_total(struct classifi_ctx *ctx, struct interface_info *iface,
+		       __u64 *packets, __u64 *bytes)
+{
+	__u64 cur_packets, cur_bytes;
+
+	*packets = iface->acc_packets;
+	*bytes = iface->acc_bytes;
+
+	if (iface_stats_read(ctx, iface->ifindex, &cur_packets, &cur_bytes) == 0) {
+		*packets += cur_packets;
+		*bytes += cur_bytes;
+	}
 }
 
 static void iface_stats_harvest(struct classifi_ctx *ctx, struct interface_info *iface)
@@ -2278,7 +2293,7 @@ static void iface_stats_harvest(struct classifi_ctx *ctx, struct interface_info 
 		bpf_map_delete_elem(ctx->iface_stats_fd, &key);
 }
 
-void interface_link_down(struct classifi_ctx *ctx, struct interface_info *iface)
+static void interface_link_down(struct classifi_ctx *ctx, struct interface_info *iface)
 {
 	iface_stats_harvest(ctx, iface);
 	iface->ifindex = 0;
@@ -2344,13 +2359,38 @@ static int interface_attach(struct classifi_ctx *ctx, struct interface_info *ifa
 	return 0;
 }
 
-int interface_reattach(struct classifi_ctx *ctx, struct interface_info *iface,
-		       int ifindex)
+static int interface_reattach(struct classifi_ctx *ctx, struct interface_info *iface,
+			      int ifindex)
 {
 	interface_link_down(ctx, iface);
 	iface->reattaches++;
 
 	return interface_attach(ctx, iface, ifindex);
+}
+
+/*
+ * Reconcile the slot with the device the kernel currently has for its name.
+ * A recreated device (netifd bridge rebuild) gets a new ifindex and takes
+ * the TC hooks down with the old one; re-attach in place so the slot keeps
+ * its counters. Called with 0 when the device is gone: the slot (and name)
+ * is kept so a re-created device can re-attach.
+ */
+void interface_ifindex_sync(struct classifi_ctx *ctx, struct interface_info *iface,
+			    int cur_ifindex)
+{
+	if (cur_ifindex == iface->ifindex)
+		return;
+
+	if (!cur_ifindex) {
+		printf("interface %s (ifindex %d) gone, waiting for re-creation\n",
+		       iface->name, iface->ifindex);
+		interface_link_down(ctx, iface);
+		return;
+	}
+
+	printf("interface %s ifindex changed (%d -> %d), re-attaching\n",
+	       iface->name, iface->ifindex, cur_ifindex);
+	interface_reattach(ctx, iface, cur_ifindex);
 }
 
 int attach_tc_program(struct classifi_ctx *ctx, const char *ifname, int discovered)
@@ -2399,6 +2439,13 @@ static void rtnl_link_handle(struct classifi_ctx *ctx, struct nlmsghdr *nlh)
 	const char *ifname = NULL;
 	struct interface_info *iface;
 
+	if (nlh->nlmsg_type == RTM_DELLINK) {
+		iface = interface_by_index(ctx, ifi->ifi_index);
+		if (iface)
+			interface_ifindex_sync(ctx, iface, 0);
+		return;
+	}
+
 	for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len)) {
 		if (rta->rta_type == IFLA_IFNAME) {
 			ifname = RTA_DATA(rta);
@@ -2406,31 +2453,14 @@ static void rtnl_link_handle(struct classifi_ctx *ctx, struct nlmsghdr *nlh)
 		}
 	}
 
-	if (nlh->nlmsg_type == RTM_DELLINK) {
-		iface = interface_by_index(ctx, ifi->ifi_index);
-		if (!iface)
-			return;
-
-		/* the device took its TC hooks with it; keep the slot (and
-		 * name) so the NEWLINK of a re-created device can re-attach */
-		printf("interface %s (ifindex %d) gone, waiting for re-creation\n",
-		       iface->name, iface->ifindex);
-		interface_link_down(ctx, iface);
-		return;
-	}
-
 	if (!ifname)
 		return;
 
-	/* NEWLINK also fires for flag/state changes; act only when the name
-	 * maps to a different device than the one the hooks were put on */
+	/* NEWLINK also fires for flag/state changes; the sync acts only when
+	 * the name maps to a different device than the one the hooks are on */
 	iface = interface_by_name(ctx, ifname);
-	if (!iface || iface->ifindex == ifi->ifi_index)
-		return;
-
-	printf("interface %s re-created (ifindex %d -> %d), re-attaching\n",
-	       ifname, iface->ifindex, ifi->ifi_index);
-	interface_reattach(ctx, iface, ifi->ifi_index);
+	if (iface)
+		interface_ifindex_sync(ctx, iface, ifi->ifi_index);
 }
 
 static void rtnl_fd_handle(struct uloop_fd *fd, unsigned int events)

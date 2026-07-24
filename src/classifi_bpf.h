@@ -42,6 +42,7 @@
 #endif
 
 #define MAX_FLOWS 8192
+#define MAX_INTERFACES 8
 
 /*
  * GRO can coalesce multiple TCP segments into a single skb, producing

@@ -57,7 +57,9 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
-	__uint(max_entries, 64);
+	/* 2x: a stale entry can linger between a missed DELLINK and the
+	 * reload catch-up */
+	__uint(max_entries, MAX_INTERFACES * 2);
 	__type(key, __u32);
 	__type(value, struct iface_stat);
 } iface_stats SEC(".maps");
@@ -87,8 +89,10 @@ struct l4_meta {
 	__u8 tcp_flags;         /* TCP header byte 13; 0 for non-TCP */
 };
 
-#define PARSE_ERR       -1      /* not a packet we track */
-#define PARSE_SHORT     -2      /* headers beyond linear data; pull and retry */
+#define PARSE_ERR         -1    /* not a packet we track */
+#define PARSE_SHORT       -2    /* headers beyond linear data; pull and retry */
+#define PARSE_SHORT_KEYED -3    /* short, but the key is complete except for
+                                 * ports; usable if a pull cannot finish */
 
 static __always_inline int parse_flow_key(struct __sk_buff *skb,
                                           struct flow_key *key,
@@ -185,6 +189,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 	if (h_proto == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6h = data + offset;
 		struct ipv6_eh eh;
+		int chain_short;
 
 		if ((void *)ip6h + sizeof(*ip6h) > data_end)
 			return PARSE_SHORT;
@@ -197,16 +202,15 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 
 		*l3_offset = offset;
 
-		/* protocol is set before the SHORT return so a chain longer
-		 * than the pull still yields a usable (ports-zero) key. */
-		if (ipv6_eh_walk((const __u8 *)(ip6h + 1), data_end,
-				 bpf_ntohs(ip6h->payload_len),
-				 ip6h->nexthdr, &eh)) {
-			key->protocol = eh.protocol;
-			return PARSE_SHORT;
-		}
-
+		chain_short = ipv6_eh_walk((const __u8 *)(ip6h + 1), data_end,
+					   bpf_ntohs(ip6h->payload_len),
+					   ip6h->nexthdr, &eh);
+		/* the walk names the protocol even when the chain outruns
+		 * data_end, so the ports-zero key stays usable */
 		key->protocol = eh.protocol;
+		if (chain_short)
+			return PARSE_SHORT_KEYED;
+
 		if (!eh.l4_ok)
 			return 0;
 
@@ -220,7 +224,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 			int payload;
 
 			if ((void *)tcph + sizeof(*tcph) > data_end)
-				return PARSE_SHORT;
+				return PARSE_SHORT_KEYED;
 
 			key->src_port = bpf_ntohs(tcph->source);
 			key->dst_port = bpf_ntohs(tcph->dest);
@@ -244,7 +248,7 @@ static __always_inline int parse_flow_key(struct __sk_buff *skb,
 			struct udphdr *udph = data + offset;
 
 			if ((void *)udph + sizeof(*udph) > data_end)
-				return PARSE_SHORT;
+				return PARSE_SHORT_KEYED;
 
 			key->src_port = bpf_ntohs(udph->source);
 			key->dst_port = bpf_ntohs(udph->dest);
@@ -347,7 +351,7 @@ int classifi(struct __sk_buff *skb)
 	 * tracked/sampled.
 	 */
 	ret = parse_flow_key(skb, &key, &l3_offset, &l4);
-	if (ret == PARSE_SHORT) {
+	if (ret == PARSE_SHORT || ret == PARSE_SHORT_KEYED) {
 		__u32 pull_len = skb->len < 256 ? skb->len : 256;
 
 		if (bpf_skb_pull_data(skb, pull_len) < 0)
@@ -355,10 +359,10 @@ int classifi(struct __sk_buff *skb)
 
 		ret = parse_flow_key(skb, &key, &l3_offset, &l4);
 	}
-	/* an IPv6 extension chain longer than the pull cannot be completed
-	 * by pulling more; track the flow with ports zero instead of losing
-	 * it. IPv4 headers always fit the pull, so v4 SHORT stays a drop. */
-	if (ret == PARSE_SHORT && key.family == FLOW_FAMILY_IPV6)
+	/* a keyed parse that is still short after the pull (an IPv6
+	 * extension chain outrunning it) cannot be completed by pulling
+	 * more; track the flow with ports zero instead of losing it */
+	if (ret == PARSE_SHORT_KEYED)
 		ret = 0;
 	if (ret < 0)
 		return TC_ACT_OK;

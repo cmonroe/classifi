@@ -76,8 +76,12 @@ static inline uint64_t monotonic_time_sec(void)
 	return (uint64_t)ts.tv_sec;
 }
 
+static inline const char *flow_family_str(__u8 family)
+{
+	return family == FLOW_FAMILY_IPV4 ? "ipv4" : "ipv6";
+}
+
 #define FLOW_TABLE_SIZE 4096
-#define MAX_INTERFACES 8
 
 /*
  * The kernel LRU map keeps evicting old entries under a flow flood, so new
@@ -90,8 +94,8 @@ static inline uint64_t monotonic_time_sec(void)
 struct interface_info {
 	const char *name;
 	int ifindex;
-	struct flow_addr local_ip;
-	__u8 local_ip_family;
+	struct flow_addr local_ip4;
+	__u8 local_ip4_set;
 	__u32 local_subnet_mask;
 	struct flow_addr local_ip6;
 	__u8 local_ip6_set;
@@ -305,11 +309,12 @@ void flow_ndpi_feed(struct classifi_ctx *ctx, struct ndpi_flow *flow,
 struct interface_info *interface_by_name(struct classifi_ctx *ctx, const char *name);
 int attach_tc_program(struct classifi_ctx *ctx, const char *ifname, int discovered);
 int detach_interface(struct classifi_ctx *ctx, struct interface_info *iface);
-int interface_reattach(struct classifi_ctx *ctx, struct interface_info *iface,
-		       int ifindex);
-void interface_link_down(struct classifi_ctx *ctx, struct interface_info *iface);
-int iface_stats_read(struct classifi_ctx *ctx, int ifindex,
-		     __u64 *packets, __u64 *bytes);
+void interface_ifindex_sync(struct classifi_ctx *ctx, struct interface_info *iface,
+			    int cur_ifindex);
+void iface_stats_total(struct classifi_ctx *ctx, struct interface_info *iface,
+		       __u64 *packets, __u64 *bytes);
+int ipv6_l4_offset(const unsigned char *l3_data, unsigned int l3_len,
+		   struct ipv6_eh *eh);
 
 int ja4_table_load(struct classifi_ctx *ctx, const char *path);
 const char *ja4_table_lookup(struct classifi_ctx *ctx, const char *fingerprint);

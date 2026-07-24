@@ -292,7 +292,6 @@ interfaces_reload(struct classifi_ctx *ctx, int *added, int *removed)
 
 	for (int i = ctx->num_interfaces - 1; i >= 0; i--) {
 		struct interface_info *iface = &ctx->interfaces[i];
-		unsigned int cur_ifindex;
 		int found = 0;
 
 		if (!iface->discovered)
@@ -312,24 +311,9 @@ interfaces_reload(struct classifi_ctx *ctx, int *added, int *removed)
 			continue;
 		}
 
-		/* A recreated device (netifd bridge rebuild) gets a new ifindex
-		 * and takes the TC hooks down with the old one; re-attach in
-		 * place so the slot keeps its counters and its name stays
-		 * matchable for the link monitor. */
-		cur_ifindex = if_nametoindex(iface->name);
-		if (cur_ifindex == (unsigned int)iface->ifindex)
-			continue;
-
-		if (!cur_ifindex) {
-			printf("interface %s gone, waiting for re-creation\n",
-			       iface->name);
-			interface_link_down(ctx, iface);
-			continue;
-		}
-
-		printf("interface %s ifindex changed (%d -> %u), re-attaching\n",
-		       iface->name, iface->ifindex, cur_ifindex);
-		interface_reattach(ctx, iface, cur_ifindex);
+		/* catch-up for changes the link monitor missed (or that
+		 * happened while it was unavailable) */
+		interface_ifindex_sync(ctx, iface, if_nametoindex(iface->name));
 	}
 
 	for (int i = 0; i < num_discovered; i++) {
@@ -418,7 +402,7 @@ flow_to_blob(struct classifi_ctx *ctx, struct ndpi_flow *flow, void *user_data)
 	blobmsg_add_string(b, "dst_ip", dst_ip);
 	blobmsg_add_u32(b, "dst_port", display_key->dst_port);
 	blobmsg_add_u32(b, "protocol", display_key->protocol);
-	blobmsg_add_string(b, "family", display_key->family == FLOW_FAMILY_IPV4 ? "ipv4" : "ipv6");
+	blobmsg_add_string(b, "family", flow_family_str(display_key->family));
 
 	blobmsg_add_string(b, "master_protocol", master_name);
 	blobmsg_add_string(b, "app_protocol", app_name);
@@ -568,31 +552,29 @@ classifi_status_handler(struct ubus_context *uctx, struct ubus_object *obj,
 	ifaces = blobmsg_open_array(&b, "interfaces");
 	for (int i = 0; i < g_ctx->num_interfaces; i++) {
 		struct interface_info *info = &g_ctx->interfaces[i];
-		__u64 pkts, bytes, cur_pkts, cur_bytes;
+		__u64 pkts, bytes;
 
 		iface_obj = blobmsg_open_table(&b, NULL);
 		blobmsg_add_string(&b, "name", info->name ? info->name : "");
 		blobmsg_add_u32(&b, "ifindex", info->ifindex);
 		blobmsg_add_u8(&b, "discovered", info->discovered);
 
-		pkts = info->acc_packets;
-		bytes = info->acc_bytes;
-		if (iface_stats_read(g_ctx, info->ifindex, &cur_pkts, &cur_bytes) == 0) {
-			pkts += cur_pkts;
-			bytes += cur_bytes;
-		}
+		iface_stats_total(g_ctx, info, &pkts, &bytes);
 		blobmsg_add_u64(&b, "packets", pkts);
 		blobmsg_add_u64(&b, "bytes", bytes);
 		blobmsg_add_u64(&b, "samples", info->samples);
 		blobmsg_add_u64(&b, "flows", info->flows);
 		blobmsg_add_u32(&b, "reattaches", info->reattaches);
 
-		if (info->local_ip_family) {
-			flow_addr_to_string(&info->local_ip, info->local_ip_family,
-					    ip_str, sizeof(ip_str));
+		if (info->local_ip4_set || info->local_ip6_set) {
+			__u8 family = info->local_ip4_set ?
+				FLOW_FAMILY_IPV4 : FLOW_FAMILY_IPV6;
+			const struct flow_addr *addr = info->local_ip4_set ?
+				&info->local_ip4 : &info->local_ip6;
+
+			flow_addr_to_string(addr, family, ip_str, sizeof(ip_str));
 			blobmsg_add_string(&b, "local_ip", ip_str);
-			blobmsg_add_string(&b, "family",
-					   info->local_ip_family == FLOW_FAMILY_IPV4 ? "ipv4" : "ipv6");
+			blobmsg_add_string(&b, "family", flow_family_str(family));
 		}
 
 		if (info->local_ip6_set) {
